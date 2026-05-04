@@ -1,0 +1,856 @@
+name: Release Packages
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      publish_npm:
+        description: "Publish npm packages (use for the first run / to bypass release trigger)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gate: wait for Tests + Simulator Tests to pass on this commit before we
+  # publish anything downstream (Homebrew bottle, apt .deb, npm tarballs).
+  # Both workflows are triggered by the same `push: tags: ['v*']` event that
+  # the /release skill does, so they run in parallel with this job. We poll
+  # `gh run list --commit <sha>` until each reports a conclusion. Fails fast
+  # if either workflow failed — npm publish is not reversible.
+  #
+  # Skipped on workflow_dispatch so the "first-run / bypass" lever still works.
+  # ---------------------------------------------------------------------------
+  await-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Wait for Tests + Simulator Tests (iOS) to pass
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "workflow_dispatch — bypassing test gate (manual publish)."
+            exit 0
+          fi
+          echo "Gating release on commit $SHA"
+          # Query by workflow *filename* via `gh api`, not by display name via
+          # `gh run list --workflow`. v0.5.155 shipped the latter and watched
+          # both gate workflows succeed while the poller logged "no run found
+          # yet" for 45 straight minutes — the `gh run list` name→id lookup
+          # silently returned [] in the release-event context, and the
+          # `2>/dev/null || echo '[]'` fallback made it look identical to an
+          # empty page. `gh api /repos/{repo}/actions/workflows/<file>/runs`
+          # skips the lookup, and we no longer swallow gh's stderr — a real
+          # API error now gets one retry then fails the gate loudly instead
+          # of burning the 45-min budget.
+          for wf_file in "test.yml" "simctl-tests.yml"; do
+            echo "::group::Waiting for $wf_file"
+            # 60-min budget per workflow. Bumped from 45 → 60 after v0.5.386's
+            # release-packages run timed out at the 45-min wall while the
+            # newer Tests run on the same SHA was still in its doc-tests
+            # leg (40-50 min total). Tests on macos-14 routinely takes 50+
+            # min wall, so 45 min was always cutting it close. 60 min still
+            # well under the GitHub workflow-level 6h timeout.
+            deadline=$(( SECONDS + 60 * 60 ))
+            retry_on_error=1
+            while :; do
+              set +e
+              # `per_page=20` (was 1) — return the LAST 20 runs on this SHA
+              # ordered by created_at desc, then `select(.conclusion ==
+              # "success")` to find the first successful one. Pre-fix
+              # per_page=1 returned only the newest run on the SHA, which
+              # might be in_progress while an older run on the SAME SHA was
+              # already green — the gate hung until timeout. Happened twice
+              # during v0.5.386's release-packages cycle (the main-branch
+              # Tests run was green, but a tag-triggered Tests run on the
+              # same SHA was newer + still running, locking the gate).
+              api_out=$(gh api \
+                "/repos/$REPO/actions/workflows/$wf_file/runs?head_sha=$SHA&per_page=20" \
+                2>&1)
+              rc=$?
+              set -e
+              if [ $rc -ne 0 ]; then
+                echo "  gh api failed (rc=$rc):"
+                echo "$api_out" | sed 's/^/    /'
+                if [ $retry_on_error -gt 0 ]; then
+                  retry_on_error=0
+                  echo "  retrying once after 10s"
+                  sleep 10
+                  continue
+                fi
+                echo "  gh api still failing after retry — failing gate."
+                exit 1
+              fi
+              retry_on_error=1
+              # Look for ANY successful run on this SHA (order-independent).
+              success_url=$(echo "$api_out" | jq -r '.workflow_runs[] | select(.status == "completed" and .conclusion == "success") | .html_url' | head -1)
+              # Look for any failed/cancelled/timed-out completed run as a
+              # FAIL signal — but only if there's NO successful run for
+              # this SHA. This way a flaky run that someone reran to green
+              # doesn't block the release.
+              fail_url=$(echo "$api_out" | jq -r '.workflow_runs[] | select(.status == "completed" and .conclusion != "success") | .html_url' | head -1)
+              # Newest run for the "still running" status line.
+              latest_status=$(echo "$api_out" | jq -r '.workflow_runs[0].status // empty')
+              latest_url=$(echo "$api_out" | jq -r '.workflow_runs[0].html_url // empty')
+              if [ -n "$success_url" ]; then
+                echo "  OK  $wf_file passed: $success_url"
+                break
+              elif [ -z "$latest_status" ]; then
+                echo "  no run found yet for $wf_file on $SHA — waiting"
+              elif [ "$latest_status" = "completed" ] && [ -n "$fail_url" ]; then
+                echo "  FAIL  $wf_file: every completed run on this SHA failed"
+                echo "        most-recent: $fail_url"
+                exit 1
+              else
+                echo "  $wf_file: latest=$latest_status ($latest_url) — waiting"
+              fi
+              if [ $SECONDS -ge $deadline ]; then
+                echo "  timed out waiting for $wf_file"
+                exit 1
+              fi
+              sleep 30
+            done
+            echo "::endgroup::"
+          done
+          echo "All gate workflows passed — proceeding to build/publish."
+
+  # ---------------------------------------------------------------------------
+  # Build release binaries for all platforms
+  # ---------------------------------------------------------------------------
+  build:
+    needs: await-tests
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact: perry-macos-aarch64
+          - os: macos-15
+            target: x86_64-apple-darwin
+            artifact: perry-macos-x86_64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: perry-linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: perry-linux-aarch64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            artifact: perry-linux-x86_64-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            artifact: perry-linux-aarch64-musl
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: perry-windows-x86_64
+
+    runs-on: ${{ matrix.os }}
+    env:
+      # Pin the macOS deployment target so bottle object files carry a
+      # stable LC_VERSION_MIN / LC_BUILD_VERSION tag regardless of which
+      # GitHub runner OS built them. Otherwise users linking against the
+      # bottle on macOS 14 see `ld: warning: ... was built for newer 'macOS'
+      # version (15.x) than being linked (14.x)` across every stdlib .o.
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Closes #394: Homebrew bottle was missing libperry_ui_ios.a so
+      # `perry compile foo.ts -o app --target ios[-simulator]` failed at link
+      # with `perry/ui imported but libperry_ui_ios.a not found`. Both macOS
+      # legs of the matrix now also cross-compile perry-runtime / perry-stdlib
+      # / perry-ui-ios for BOTH the iOS device and simulator triples and ship
+      # the resulting .a files alongside the host artifacts. Device libs use
+      # the canonical _ios suffix (`libperry_ui_ios.a`); simulator libs use
+      # `_ios_sim` (`libperry_ui_ios_sim.a`) so they don't collide in the
+      # bottle's flat lib dir. library_search.rs's cross-compile branch
+      # picks the right variant per --target. tier-3 tvOS/visionOS/watchOS
+      # are still a follow-up (need nightly + -Zbuild-std).
+      - name: Install iOS Rust targets (macOS)
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+
+      - name: Install GTK4 development libraries (Linux glibc)
+        if: runner.os == 'Linux' && !endsWith(matrix.target, '-musl')
+        # libgstreamer1.0-dev added in v0.5.456 — perry-ui-gtk4 pulls in
+        # gstreamer-sys via the perry/media (#351, v0.5.440) GTK4 backend
+        # for streaming audio playback. Mirrors the doc-tests-gtk4 fix
+        # from v0.5.441 (commit a535a984).
+        # libunwind-dev added in v0.5.461 — on ubuntu-22.04 (jammy)
+        # libgstreamer1.0-dev hard-depends on libunwind-dev which is held
+        # back in the runner image, so apt-get install fails with "Unable
+        # to correct problems" unless libunwind-dev is named explicitly.
+        # ubuntu-24.04-arm doesn't have this issue but the explicit name
+        # is harmless there.
+        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libunwind-dev libgstreamer1.0-dev
+
+      - name: Install musl tools (Linux musl)
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build perry
+        # Build only the CLI crate. The default-members list includes
+        # perry-jsruntime (V8), which downloads a prebuilt that 404s on
+        # musl and isn't shipped in the release tarball on any platform.
+        run: cargo build --release --target ${{ matrix.target }} -p perry
+
+      - name: Build runtime libraries
+        run: |
+          cargo build --release --target ${{ matrix.target }} -p perry-runtime
+          cargo build --release --target ${{ matrix.target }} -p perry-stdlib
+
+      - name: Build UI library (macOS)
+        if: runner.os == 'macOS'
+        run: cargo build --release --target ${{ matrix.target }} -p perry-ui-macos
+
+      # Closes #394: cross-compile the runtime + stdlib + UI for both the
+      # iOS device and simulator triples (both Tier-2 stable). Library
+      # filenames are disambiguated in the staging step — device libs keep
+      # the canonical `_ios` name, simulator libs get a `_sim` variant
+      # suffix so the bottle can ship both side-by-side. tvOS/visionOS/
+      # watchOS are Tier-3 (need nightly + -Zbuild-std) and out of scope.
+      - name: Build iOS cross-compile libraries (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          for triple in aarch64-apple-ios aarch64-apple-ios-sim; do
+            cargo build --release --target "$triple" -p perry-runtime
+            cargo build --release --target "$triple" -p perry-stdlib
+            cargo build --release --target "$triple" -p perry-ui-ios
+          done
+
+      - name: Build UI library (Linux glibc)
+        if: runner.os == 'Linux' && !endsWith(matrix.target, '-musl')
+        run: cargo build --release --target ${{ matrix.target }} -p perry-ui-gtk4
+
+      - name: Build UI library (Windows)
+        if: runner.os == 'Windows'
+        run: cargo build --release --target ${{ matrix.target }} -p perry-ui-windows
+
+      - name: Package release archive (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/perry staging/
+          # Include static libraries for linking (runtime, stdlib, UI)
+          for lib in libperry_runtime.a libperry_stdlib.a libperry_ui_macos.a libperry_ui_gtk4.a; do
+            if [ -f "target/${{ matrix.target }}/release/$lib" ]; then
+              cp "target/${{ matrix.target }}/release/$lib" staging/
+            fi
+          done
+          # Closes #394: macOS legs also ship iOS-cross-compiled libs.
+          # Device variant uses the canonical `_ios` suffix; simulator
+          # variant gets a `_sim` suffix so both can coexist in the
+          # bottle's flat lib dir. library_search.rs's cross-compile
+          # branch composes the right name based on --target.
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            dev_dir="target/aarch64-apple-ios/release"
+            if [ -f "$dev_dir/libperry_runtime.a" ]; then
+              cp "$dev_dir/libperry_runtime.a" "staging/libperry_runtime_ios.a"
+            fi
+            if [ -f "$dev_dir/libperry_stdlib.a" ]; then
+              cp "$dev_dir/libperry_stdlib.a" "staging/libperry_stdlib_ios.a"
+            fi
+            if [ -f "$dev_dir/libperry_ui_ios.a" ]; then
+              cp "$dev_dir/libperry_ui_ios.a" "staging/libperry_ui_ios.a"
+            fi
+            sim_dir="target/aarch64-apple-ios-sim/release"
+            if [ -f "$sim_dir/libperry_runtime.a" ]; then
+              cp "$sim_dir/libperry_runtime.a" "staging/libperry_runtime_ios_sim.a"
+            fi
+            if [ -f "$sim_dir/libperry_stdlib.a" ]; then
+              cp "$sim_dir/libperry_stdlib.a" "staging/libperry_stdlib_ios_sim.a"
+            fi
+            if [ -f "$sim_dir/libperry_ui_ios.a" ]; then
+              cp "$sim_dir/libperry_ui_ios.a" "staging/libperry_ui_ios_sim.a"
+            fi
+          fi
+          cd staging
+          tar czf ../${{ matrix.artifact }}.tar.gz *
+
+      # Bundle xwin.exe so `perry setup windows` can download the MS CRT + Windows
+      # SDK without requiring users to have Rust installed. xwin is pinned here to
+      # control updates — bump the version when switching to a newer xwin release.
+      # See crates/perry/src/commands/setup.rs::windows_wizard for the consumer.
+      - name: Build xwin.exe for bundling (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo install xwin --locked --version 0.9.0 --root xwin-install --target ${{ matrix.target }}
+
+      - name: Package release archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging
+          Copy-Item "target/${{ matrix.target }}/release/perry.exe" staging/
+          Copy-Item "xwin-install/bin/xwin.exe" staging/
+          # Include static libraries for linking (runtime, stdlib, UI)
+          $libs = @("perry_runtime.lib", "perry_stdlib.lib", "perry_ui_windows.lib")
+          foreach ($lib in $libs) {
+            $path = "target/${{ matrix.target }}/release/$lib"
+            if (Test-Path $path) {
+              Copy-Item $path staging/
+            }
+          }
+          Compress-Archive -Path staging/* -DestinationPath "${{ matrix.artifact }}.zip"
+
+      # SHA256 sidecars uploaded next to each archive so package-manager
+      # manifests (Scoop autoupdate, future winget/chocolatey/Homebrew bumps)
+      # can resolve hashes by URL without re-downloading the archive on the
+      # bumper machine. The sidecar format is `<hash>  <filename>` (two
+      # spaces — same as `sha256sum`'s default), which Scoop's hash.url
+      # mode parses out of the box.
+      - name: Compute SHA256 sidecar (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          # Linux ships `sha256sum` (coreutils); macOS ships `shasum -a 256`
+          # but no `sha256sum`. Both produce the same `<hash>  <filename>`
+          # output format that Scoop / Homebrew / dpkg parse from the first
+          # whitespace-separated field. Pre-fix the macOS legs of this matrix
+          # bombed at v0.5.386's release-packages.yml run with
+          # `sha256sum: command not found` (exit 127), cancelling the
+          # x86_64-apple-darwin sibling via fail-fast and shipping a release
+          # without macOS binaries.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.artifact }}.tar.gz" > "${{ matrix.artifact }}.tar.gz.sha256"
+          else
+            shasum -a 256 "${{ matrix.artifact }}.tar.gz" > "${{ matrix.artifact }}.tar.gz.sha256"
+          fi
+          cat "${{ matrix.artifact }}.tar.gz.sha256"
+
+      - name: Compute SHA256 sidecar (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 "${{ matrix.artifact }}.zip").Hash.ToLower()
+          # Match `sha256sum` output exactly (two-space separator) for cross-platform
+          # tooling that grep-cuts the first field.
+          "$hash  ${{ matrix.artifact }}.zip" | Out-File -Encoding ascii "${{ matrix.artifact }}.zip.sha256"
+          Get-Content "${{ matrix.artifact }}.zip.sha256"
+
+      - name: Upload release asset (Unix)
+        if: runner.os != 'Windows' && (github.event_name == 'release' || github.event_name == 'workflow_dispatch')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # workflow_dispatch fallback: `github.event.release.tag_name` is
+          # only set for `release` events, so when triggered manually we
+          # look up the latest published release tag and upload to that.
+          # Pre-fix the v0.5.386 release shipped with NO assets uploaded
+          # because the original `release` run failed at await-tests, my
+          # workflow_dispatch bypass succeeded the build but skipped this
+          # upload step entirely.
+          TAG="${{ github.event.release.tag_name }}"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+            echo "workflow_dispatch fallback: uploading to latest release tag $TAG"
+          fi
+          gh release upload "$TAG" "${{ matrix.artifact }}.tar.gz" --clobber
+          gh release upload "$TAG" "${{ matrix.artifact }}.tar.gz.sha256" --clobber
+
+      - name: Upload release asset (Windows)
+        if: runner.os == 'Windows' && (github.event_name == 'release' || github.event_name == 'workflow_dispatch')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $tag = "${{ github.event.release.tag_name }}"
+          if (-not $tag) {
+            $tag = (gh release list --limit 1 --json tagName --jq '.[0].tagName')
+            Write-Host "workflow_dispatch fallback: uploading to latest release tag $tag"
+          }
+          gh release upload "$tag" "${{ matrix.artifact }}.zip" --clobber
+          gh release upload "$tag" "${{ matrix.artifact }}.zip.sha256" --clobber
+
+      - name: Upload build artifact (Unix, for deb + npm-publish jobs)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: staging/
+
+      - name: Upload build artifact (Windows, for npm-publish job)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: staging/
+
+  # ---------------------------------------------------------------------------
+  # Update Homebrew tap
+  # ---------------------------------------------------------------------------
+  homebrew:
+    needs: build
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get release info
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # workflow_dispatch fallback: github.event.release.tag_name is
+          # only set for `release` events. When triggered manually, fall
+          # back to the latest published release tag — same pattern the
+          # upload step uses (see v0.5.392 for the publish-jobs sweep).
+          TAG="${{ github.event.release.tag_name }}"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+            echo "workflow_dispatch fallback: using latest release tag $TAG"
+          fi
+          VERSION="${TAG#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Download source tarball and compute SHA256
+        id: sha
+        run: |
+          curl -sL "https://github.com/${{ github.repository }}/archive/refs/tags/${{ steps.release.outputs.tag }}.tar.gz" -o source.tar.gz
+          SHA256=$(sha256sum source.tar.gz | cut -d' ' -f1)
+          echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
+
+      - name: Download macOS ARM64 bottle and compute SHA256
+        id: bottle_arm64
+        run: |
+          curl -sL "https://github.com/${{ github.repository }}/releases/download/${{ steps.release.outputs.tag }}/perry-macos-aarch64.tar.gz" -o perry-macos-aarch64.tar.gz
+          SHA256=$(sha256sum perry-macos-aarch64.tar.gz | cut -d' ' -f1)
+          echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
+
+      - name: Download macOS x86_64 bottle and compute SHA256
+        id: bottle_x64
+        run: |
+          curl -sL "https://github.com/${{ github.repository }}/releases/download/${{ steps.release.outputs.tag }}/perry-macos-x86_64.tar.gz" -o perry-macos-x86_64.tar.gz
+          SHA256=$(sha256sum perry-macos-x86_64.tar.gz | cut -d' ' -f1)
+          echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
+
+      - name: Update Homebrew tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/PerryTS/homebrew-perry.git" tap
+          cd tap
+
+          mkdir -p Formula
+
+          cat > Formula/perry.rb << 'FORMULA_EOF'
+          class Perry < Formula
+            desc "Native TypeScript compiler — compiles TypeScript to native executables"
+            homepage "https://github.com/PerryTS/perry"
+            version "${{ steps.release.outputs.version }}"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/PerryTS/perry/releases/download/${{ steps.release.outputs.tag }}/perry-macos-aarch64.tar.gz"
+                sha256 "${{ steps.bottle_arm64.outputs.sha256 }}"
+              else
+                url "https://github.com/PerryTS/perry/releases/download/${{ steps.release.outputs.tag }}/perry-macos-x86_64.tar.gz"
+                sha256 "${{ steps.bottle_x64.outputs.sha256 }}"
+              end
+            end
+
+            on_linux do
+              url "https://github.com/PerryTS/perry/archive/refs/tags/${{ steps.release.outputs.tag }}.tar.gz"
+              sha256 "${{ steps.sha.outputs.sha256 }}"
+              depends_on "rust" => :build
+            end
+
+            def install
+              if OS.mac?
+                bin.install "perry"
+                lib.install Dir["libperry_*.a"]
+              else
+                system "cargo", "build", "--release"
+                system "cargo", "build", "--release", "-p", "perry-runtime", "-p", "perry-stdlib"
+                bin.install "target/release/perry"
+                lib.install Dir["target/release/libperry_*.a"]
+              end
+            end
+
+            def caveats
+              <<~EOS
+                Perry requires a C linker to link compiled executables.
+
+                macOS:  Xcode Command Line Tools (xcode-select --install)
+                Linux:  GCC or Clang (sudo apt install build-essential)
+
+                Quick start:
+                  echo 'console.log("hello")' > hello.ts
+                  perry hello.ts -o hello && ./hello
+              EOS
+            end
+
+            test do
+              assert_match "perry", shell_output("#{bin}/perry --version")
+              (testpath/"test.ts").write('console.log("works");')
+              system bin/"perry", testpath/"test.ts", "-o", testpath/"test"
+              assert_equal "works\n", shell_output(testpath/"test")
+            end
+          end
+          FORMULA_EOF
+
+          # Remove leading whitespace from heredoc indentation
+          sed -i 's/^          //' Formula/perry.rb
+
+          git config user.name "perry-bot"
+          git config user.email "bot@perryts.com"
+          git add Formula/perry.rb
+          git commit -m "perry ${VERSION}" || echo "No changes"
+          git push
+
+  # ---------------------------------------------------------------------------
+  # Build .deb packages and update APT repository
+  # ---------------------------------------------------------------------------
+  apt:
+    needs: build
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - artifact: perry-linux-x86_64
+            arch: amd64
+          - artifact: perry-linux-aarch64
+            arch: arm64
+    steps:
+      - name: Get release info
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+            echo "workflow_dispatch fallback: using latest release tag $TAG"
+          fi
+          VERSION="${TAG#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: staging/
+
+      - name: Build .deb package
+        run: |
+          VERSION="${{ steps.release.outputs.version }}"
+          ARCH="${{ matrix.arch }}"
+          PKG="perry_${VERSION}_${ARCH}"
+
+          mkdir -p "${PKG}/DEBIAN"
+          mkdir -p "${PKG}/usr/bin"
+          mkdir -p "${PKG}/usr/lib/perry"
+
+          cat > "${PKG}/DEBIAN/control" << EOF
+          Package: perry
+          Version: ${VERSION}
+          Section: devel
+          Priority: optional
+          Architecture: ${ARCH}
+          Depends: gcc | clang
+          Maintainer: Perry Team <hello@perryts.com>
+          Homepage: https://github.com/PerryTS/perry
+          Description: Native TypeScript compiler
+           Perry compiles TypeScript source code directly to native
+           executables using Cranelift for code generation.
+          EOF
+          sed -i 's/^          //' "${PKG}/DEBIAN/control"
+
+          cp staging/perry "${PKG}/usr/bin/"
+          chmod 755 "${PKG}/usr/bin/perry"
+
+          for lib in libperry_runtime.a libperry_stdlib.a libperry_ui_gtk4.a; do
+            if [ -f "staging/$lib" ]; then
+              cp "staging/$lib" "${PKG}/usr/lib/perry/"
+            fi
+          done
+
+          # Add library path config so perry can find its libs
+          mkdir -p "${PKG}/etc/perry"
+          echo "/usr/lib/perry" > "${PKG}/etc/perry/lib-path"
+
+          dpkg-deb --build "${PKG}"
+
+      - name: Upload .deb as release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.release.outputs.version }}"
+          ARCH="${{ matrix.arch }}"
+          gh release upload "${{ github.event.release.tag_name }}" \
+            "perry_${VERSION}_${ARCH}.deb" \
+            --repo "${{ github.repository }}" --clobber
+
+      - name: Upload .deb artifact (for apt-repo job)
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: "*.deb"
+
+  # ---------------------------------------------------------------------------
+  # Update APT repository (GitHub Pages)
+  # ---------------------------------------------------------------------------
+  apt-repo:
+    needs: apt
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get release info
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+            echo "workflow_dispatch fallback: using latest release tag $TAG"
+          fi
+          VERSION="${TAG#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Download .deb packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          merge-multiple: true
+          path: debs/
+
+      - name: Clone APT repo
+        env:
+          APT_TOKEN: ${{ secrets.APT_REPO_TOKEN }}
+        run: git clone "https://x-access-token:${APT_TOKEN}@github.com/PerryTS/perry-apt.git" apt-repo
+
+      - name: Import GPG key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+
+      - name: Update repository
+        env:
+          GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
+        run: |
+          cd apt-repo
+
+          # Copy new .deb files into pool
+          mkdir -p pool/main/p/perry
+          cp ../debs/*.deb pool/main/p/perry/
+
+          # Generate Packages index for each architecture
+          for ARCH in amd64 arm64; do
+            mkdir -p dists/stable/main/binary-${ARCH}
+            dpkg-scanpackages --arch ${ARCH} pool/ > dists/stable/main/binary-${ARCH}/Packages
+            gzip -9c dists/stable/main/binary-${ARCH}/Packages > dists/stable/main/binary-${ARCH}/Packages.gz
+          done
+
+          # Generate Release file
+          cd dists/stable
+          cat > Release << EOF
+          Origin: PerryTS
+          Label: Perry
+          Suite: stable
+          Codename: stable
+          Architectures: amd64 arm64
+          Components: main
+          Description: Perry native TypeScript compiler
+          EOF
+          sed -i 's/^          //' Release
+
+          # Add checksums
+          {
+            echo "MD5Sum:"
+            find main/ -type f | while read f; do
+              echo " $(md5sum "$f" | cut -d' ' -f1) $(wc -c < "$f") $f"
+            done
+            echo "SHA256:"
+            find main/ -type f | while read f; do
+              echo " $(sha256sum "$f" | cut -d' ' -f1) $(wc -c < "$f") $f"
+            done
+          } >> Release
+
+          # Sign
+          gpg --batch --yes --default-key "${GPG_KEY_ID}" -abs -o Release.gpg Release
+          gpg --batch --yes --default-key "${GPG_KEY_ID}" --clearsign -o InRelease Release
+
+          cd ../..
+
+          # Export public key for users
+          gpg --armor --export "${GPG_KEY_ID}" > perry.gpg.pub
+
+          git config user.name "perry-bot"
+          git config user.email "bot@perryts.com"
+          git add -A
+          git commit -m "perry ${{ steps.release.outputs.version }}"
+          git push
+
+  # ---------------------------------------------------------------------------
+  # Publish to winget (Windows Package Manager)
+  # ---------------------------------------------------------------------------
+  winget:
+    needs: build
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - name: Get release info
+        id: release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.event.release.tag_name }}"
+          if (-not $tag) {
+            $tag = (gh release list --limit 1 --json tagName --jq '.[0].tagName')
+            Write-Host "workflow_dispatch fallback: using latest release tag $tag"
+          }
+          $version = $tag -replace '^v', ''
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+          echo "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Download wingetcreate
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://aka.ms/wingetcreate/latest" -OutFile wingetcreate.exe
+
+      - name: Sync WINGET_PAT-user's winget-pkgs fork with upstream
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_PAT }}
+        # wingetcreate --submit uses the AUTHENTICATED USER'S fork of
+        # microsoft/winget-pkgs, not the org's (PerryTS/winget-pkgs was a
+        # red herring left over from a misread of how wingetcreate works).
+        # Query the token's current user, resolve `<user>/winget-pkgs`,
+        # then merge-upstream. microsoft/winget-pkgs gets thousands of
+        # commits per day — any fork untouched for a week is already behind
+        # enough that wingetcreate's internal SyncFork call will throw the
+        # opaque "forked repository could not be synced" error we saw on
+        # the v0.5.158 first-real-release run.
+        run: |
+          $user = (gh api /user --jq '.login').Trim()
+          Write-Host "Authenticated user: $user"
+          Write-Host "Syncing $user/winget-pkgs from microsoft/winget-pkgs"
+          gh repo sync "$user/winget-pkgs" --source microsoft/winget-pkgs --force
+
+      - name: Update winget manifest
+        shell: pwsh
+        env:
+          WINGET_PAT: ${{ secrets.WINGET_PAT }}
+        run: |
+          $url = "https://github.com/${{ github.repository }}/releases/download/${{ steps.release.outputs.tag }}/perry-windows-x86_64.zip"
+          ./wingetcreate.exe update PerryTS.Perry `
+            --urls $url `
+            --version "${{ steps.release.outputs.version }}" `
+            --token $env:WINGET_PAT `
+            --submit
+
+  # ---------------------------------------------------------------------------
+  # Notify build workers to update perry
+  # ---------------------------------------------------------------------------
+  update-workers:
+    needs: build
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get release version
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+            echo "workflow_dispatch fallback: using latest release tag $TAG"
+          fi
+          VERSION="${TAG#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger worker perry update
+        env:
+          HUB_ADMIN_SECRET: ${{ secrets.HUB_ADMIN_SECRET }}
+        run: |
+          echo "Triggering perry update on build workers (expected: ${{ steps.release.outputs.version }})..."
+          RESPONSE=$(curl -sf -X POST "https://hub.perryts.com/api/v1/admin/update-perry" \
+            -H "Authorization: Bearer ${HUB_ADMIN_SECRET}" \
+            -H "Content-Type: application/json" \
+            -d "{\"expected_version\": \"${{ steps.release.outputs.version }}\"}" 2>&1) || true
+          echo "Hub response: ${RESPONSE}"
+
+  # ---------------------------------------------------------------------------
+  # Publish npm packages (@perryts/perry + 7 per-platform packages)
+  #
+  # Uses OIDC / Trusted Publishers (no long-lived NPM_TOKEN). Each of the 8
+  # package names must be registered on npmjs.com with this repo + workflow
+  # as a Trusted Publisher. See npm/README.md for the one-time setup.
+  # ---------------------------------------------------------------------------
+  npm-publish:
+    needs: build
+    if: >
+      github.event_name == 'release' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_npm == 'true')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write          # REQUIRED for OIDC + npm --provenance
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Upgrade npm (OIDC Trusted Publisher requires >= 11.5.1)
+        # Node 20 ships npm 10.x; versions below 11.5.1 silently fail the OIDC
+        # handshake and the registry returns a misleading 404 ("'pkg@ver' is
+        # not in this registry") on PUT. See npm/cli#9088.
+        run: npm install -g npm@latest
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts/
+
+      - name: Stage npm packages
+        run: ./scripts/stage-npm.sh release-artifacts/
+
+      - name: Sanity-check staged packages
+        run: |
+          for dir in npm/perry npm/perry-*; do
+            echo "=== $dir ==="
+            ls -la "$dir"
+            if [ -f "$dir/package.json" ]; then
+              node -e "const p=require('./$dir/package.json'); console.log(p.name, p.version)"
+            else
+              echo "MISSING package.json in $dir" >&2
+              exit 1
+            fi
+          done
+
+      - name: Publish platform packages
+        # `./` prefix is required — `npm publish npm/foo` parses `npm/foo` as
+        # a GitHub shorthand (user/repo) and tries ssh://git@github.com/npm/foo.git.
+        # See run 24632227482 npm-publish job for the symptom.
+        run: |
+          set -e
+          for pkg in ./npm/perry-*; do
+            echo "=== publishing $pkg ==="
+            npm publish "$pkg" --access public --provenance
+          done
+
+      - name: Publish wrapper (@perryts/perry) last
+        run: npm publish ./npm/perry --access public --provenance

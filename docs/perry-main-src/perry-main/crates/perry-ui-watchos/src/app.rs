@@ -1,0 +1,59 @@
+//! App lifecycle for watchOS.
+//!
+//! Since watchOS uses SwiftUI's @main App, the actual app lifecycle is managed
+//! by the fixed PerryWatchApp.swift. This module stores config and provides
+//! the entry point that Swift calls to run the compiled TypeScript init code.
+
+use std::cell::RefCell;
+
+use crate::tree::{self, NodeData, NodeKind};
+
+thread_local! {
+    static PENDING_BODY: RefCell<Option<i64>> = RefCell::new(None);
+}
+
+pub fn app_create(_title_ptr: *const u8, _width: f64, _height: f64) -> i64 {
+    // On watchOS, the app is created by the SwiftUI @main struct.
+    // We just return a handle to satisfy the API contract.
+    1
+}
+
+pub fn app_set_body(_app_handle: i64, root_handle: i64) {
+    tree::set_root(root_handle);
+    PENDING_BODY.with(|b| {
+        *b.borrow_mut() = Some(root_handle);
+    });
+}
+
+pub fn app_run(_app_handle: i64) {
+    // On watchOS, the SwiftUI run loop is managed by PerryWatchApp.swift.
+    // The compiled TypeScript calls perry_ui_app_run() at the end of init,
+    // but on watchOS this is a no-op — the Swift @main struct drives the loop.
+    //
+    // perry_main_init() is called from Swift before the app body is rendered,
+    // so by the time SwiftUI queries the tree, it's fully built.
+    install_test_mode_exit_timer();
+}
+
+/// If `PERRY_UI_TEST_MODE=1`, schedule a background thread that exits the
+/// process cleanly after the configured delay. watchOS has no
+/// screenshot-capable runtime yet (no `screenshot.rs` in this crate), so the
+/// test-mode here is purely a "did the program launch without crashing?"
+/// signal. Useful for CI smoke-checks against `--target watchos[-simulator]`
+/// builds under `xcrun simctl launch --console`.
+///
+/// Uses a plain thread::sleep rather than NSTimer because the main runloop on
+/// watchOS is Swift's, and scheduling onto it from Rust early-init is fragile.
+fn install_test_mode_exit_timer() {
+    if !perry_ui_testkit::is_test_mode() {
+        return;
+    }
+    let delay_ms = perry_ui_testkit::exit_delay_ms();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms as u64));
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        std::process::exit(0);
+    });
+}

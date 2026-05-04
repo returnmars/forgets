@@ -1,0 +1,15 @@
+[package]
+name = "perry-ui-geisterhand"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "In-process input fuzzer HTTP server for Perry UI"
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+tiny_http = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+rand = "0.8"

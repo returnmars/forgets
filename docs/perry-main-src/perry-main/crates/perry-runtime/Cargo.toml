@@ -1,0 +1,67 @@
+[package]
+name = "perry-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Runtime library: GC, JSValue, builtins"
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[features]
+default = ["full"]
+# `full` only opt-ins the small Node-API helpers (os.hostname / os.homedir).
+# `postgres`, `redis`, `whoami` were previously listed here but were either
+# unimported (postgres, whoami) or only used by a now-deleted `redis_client.rs`
+# whose `js_redis_*` symbols nothing in codegen ever resolved (perry-stdlib's
+# ioredis.rs is the live Redis path). Removing them drops ~1.5+ MB from every
+# Perry binary that links libperry_runtime.a.
+full = ["dep:hostname", "dep:dirs"]
+# When perry-stdlib is the consumer, exclude no-op stubs to avoid duplicate symbols
+stdlib = []
+# Enable geisterhand in-process fuzzer (callback registry + dispatch queue)
+geisterhand = []
+# iOS/tvOS game loop: provides main() that spawns user code on game thread + UIApplicationMain
+ios-game-loop = []
+# watchOS game loop: provides main() that spawns user code on game thread + WKApplicationMain.
+# For Metal/wgpu engines that need to own the draw surface (see crates/perry-runtime/src/watchos_game_loop.rs).
+watchos-game-loop = []
+# HarmonyOS NAPI entry: provides napi_module_register + a `run` export that
+# invokes Perry's compiled `main()`. Auto-enabled by the compiler when
+# --target harmonyos[-simulator] is passed (see crates/perry-runtime/src/ohos_napi.rs).
+ohos-napi = []
+
+[dependencies]
+thiserror.workspace = true
+anyhow.workspace = true
+libc = "0.2"
+rand = "0.8"
+regex = "1"
+# Taffy — flexbox / grid layout engine for the perry/tui module
+# (#358 Phase 3). Same crate Bevy and Dioxus use; pure Rust, no FFI.
+taffy = { version = "0.7", default-features = false, features = ["std", "flexbox", "taffy_tree"] }
+fancy-regex = "0.14"
+itoa = "1"
+ryu = "1"
+base64 = "0.22"
+hostname = { version = "0.4", optional = true }
+dirs = { version = "5", optional = true }
+lazy_static = "1.4"
+
+serde_json = "1"
+unicode-normalization = "0.1"
+# Issue #62: mimalloc replaces the system allocator for gc_malloc/arena/etc.
+# macOS `malloc` is ~25-40ns/alloc; mimalloc's per-thread free-list is ~5-10ns.
+# Set as #[global_allocator] in lib.rs, so it covers Rust heap allocations in
+# both the `perry` CLI and the compiled-TypeScript executables linked against
+# libperry_runtime.a.
+mimalloc = { version = "0.1", default-features = false }
+
+# We'll add GC bindings later
+# For now, use a simple bump allocator or leak memory for MVP
+
+# build.rs auto-generates no-op `perry_ui_*` FFI stubs for the harmonyos
+# build (cfg(feature = "ohos-napi")) by reading the dispatch tables here.
+# See `build.rs` and issue #395 for the rationale.
+[build-dependencies]
+perry-dispatch = { path = "../perry-dispatch" }

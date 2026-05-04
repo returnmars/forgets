@@ -1,0 +1,14 @@
+[package]
+name = "perry-codegen-arkts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ArkUI/ArkTS code generation for Perry --target harmonyos (declarative UI emission)"
+
+[dependencies]
+perry-hir.workspace = true
+perry-types.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+perry-types.workspace = true

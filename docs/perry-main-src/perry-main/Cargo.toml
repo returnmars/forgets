@@ -1,0 +1,195 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/perry",
+    "crates/perry-parser",
+    "crates/perry-types",
+    "crates/perry-hir",
+    "crates/perry-transform",
+    "crates/perry-codegen",
+    "crates/perry-dispatch",
+    "crates/perry-runtime",
+    "crates/perry-jsruntime",
+    "crates/perry-stdlib",
+    "crates/perry-diagnostics",
+    "crates/perry-ui",
+    "crates/perry-ui-macos",
+    "crates/perry-ui-ios",
+    "crates/perry-ui-visionos",
+    "crates/perry-ui-android",
+    "crates/perry-ui-gtk4",
+    "crates/perry-ui-windows",
+    "crates/perry-ui-watchos",
+    "crates/perry-ui-tvos",
+    "crates/perry-ui-geisterhand",
+    "crates/perry-codegen-js",
+    "crates/perry-codegen-swiftui",
+    "crates/perry-codegen-arkts",
+    "crates/perry-codegen-glance",
+    "crates/perry-codegen-wear-tiles",
+    "crates/perry-codegen-wasm",
+    "crates/perry-ui-test",
+    "crates/perry-ui-testkit",
+    "crates/perry-doc-tests",
+    "crates/perry-updater",
+]
+# Only build platform-independent crates by default.
+# Platform-specific UI crates (perry-ui-macos, perry-ui-ios, etc.) must be built
+# explicitly with -p on their target platform.
+default-members = [
+    "crates/perry",
+    "crates/perry-parser",
+    "crates/perry-types",
+    "crates/perry-hir",
+    "crates/perry-transform",
+    "crates/perry-codegen",
+    "crates/perry-dispatch",
+    "crates/perry-runtime",
+    "crates/perry-jsruntime",
+    "crates/perry-stdlib",
+    "crates/perry-diagnostics",
+    "crates/perry-ui",
+    "crates/perry-codegen-js",
+    "crates/perry-codegen-swiftui",
+    "crates/perry-codegen-arkts",
+    "crates/perry-codegen-glance",
+    "crates/perry-codegen-wear-tiles",
+    "crates/perry-codegen-wasm",
+    "crates/perry-updater",
+]
+
+# Aggressive release optimizations for small, fast binaries
+[profile.release]
+lto = "thin"          # Thin LTO for faster builds and fewer duplicate symbols
+codegen-units = 1     # Better optimization, slower compile
+panic = "unwind"      # Allow catch_unwind for graceful error recovery
+strip = true          # Strip symbols automatically
+opt-level = 3         # Maximum optimization
+
+# For the runtime/stdlib static libraries
+[profile.release.package.perry-runtime]
+opt-level = 3
+strip = false
+
+# UI crates must NOT strip — they export #[no_mangle] extern "C" symbols
+[profile.release.package.perry-ui-macos]
+strip = false
+codegen-units = 16
+
+[profile.release.package.perry-ui-gtk4]
+strip = false
+codegen-units = 16
+
+[profile.release.package.perry-ui-windows]
+strip = false
+codegen-units = 16
+
+[profile.release.package.perry-ui-geisterhand]
+strip = false
+codegen-units = 16
+
+[profile.release.package.perry-ui-ios]
+strip = false
+codegen-units = 16
+
+[profile.release.package.perry-ui-visionos]
+strip = false
+codegen-units = 16
+
+[profile.release.package.perry-ui-tvos]
+strip = false
+codegen-units = 16
+
+[profile.release.package.perry-ui-android]
+strip = false
+codegen-units = 16
+
+[profile.release.package.perry-ui-watchos]
+strip = false
+codegen-units = 16
+
+[profile.release.package.perry-stdlib]
+opt-level = "s"       # Optimize for size in stdlib
+
+[profile.release.package.perry-jsruntime]
+opt-level = 3
+
+[workspace.package]
+version = "0.5.494"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/PerryTS/perry"
+
+[workspace.dependencies]
+# SWC for TypeScript parsing
+swc_ecma_parser = "32.0"
+swc_ecma_ast = "19.0"
+swc_common = "18.0"
+
+# Runtime dependencies
+# bdwgc for garbage collection (Boehm GC)
+# We'll use libgc-sys or similar
+
+# Utilities
+thiserror = "1.0"
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.10"
+clap = { version = "4.5", features = ["derive"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Terminal UI
+indicatif = "0.17"
+console = "0.15"
+dialoguer = "0.11"
+
+# File system
+walkdir = "2.4"
+notify = "6.1"
+
+# Diff generation
+similar = "2.4"
+
+# Terminal detection
+atty = "0.2"
+
+# HTTP / WebSocket (for publish command)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "blocking"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+url = "2"
+dirs = "6"
+
+# .env file loading (for publish command)
+dotenvy = "0.15"
+
+# Archive creation (for publish command)
+flate2 = "1"
+tar = "0.4"
+base64 = "0.22"
+zip = "2"
+
+# Internal crates
+perry-parser = { path = "crates/perry-parser" }
+perry-types = { path = "crates/perry-types" }
+perry-hir = { path = "crates/perry-hir" }
+perry-transform = { path = "crates/perry-transform" }
+perry-codegen = { path = "crates/perry-codegen" }
+perry-dispatch = { path = "crates/perry-dispatch" }
+perry-runtime = { path = "crates/perry-runtime" }
+perry-stdlib = { path = "crates/perry-stdlib" }
+perry-diagnostics = { path = "crates/perry-diagnostics" }
+perry-jsruntime = { path = "crates/perry-jsruntime" }
+perry-codegen-js = { path = "crates/perry-codegen-js" }
+perry-codegen-swiftui = { path = "crates/perry-codegen-swiftui" }
+perry-codegen-arkts = { path = "crates/perry-codegen-arkts" }
+perry-codegen-glance = { path = "crates/perry-codegen-glance" }
+perry-codegen-wear-tiles = { path = "crates/perry-codegen-wear-tiles" }
+perry-codegen-wasm = { path = "crates/perry-codegen-wasm" }
+perry-ui-testkit = { path = "crates/perry-ui-testkit" }
+perry-updater = { path = "crates/perry-updater" }

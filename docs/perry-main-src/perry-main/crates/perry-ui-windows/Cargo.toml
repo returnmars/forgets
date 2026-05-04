@@ -1,0 +1,53 @@
+[package]
+name = "perry-ui-windows"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+perry-ui = { path = "../perry-ui" }
+perry-ui-testkit = { workspace = true }
+perry-runtime = { path = "../perry-runtime", default-features = false, features = ["stdlib"] }
+libc = "0.2"
+# Proper PNG encoder (deflate). The old inline encoder wrote stored blocks
+# → 2.7 MB baseline for a 900×788 window. With real compression: ~50 KB.
+png = "0.17"
+
+[features]
+geisterhand = []
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_DataExchange",
+    "Win32_System_Ole",
+    "Win32_System_Com",
+    "Win32_System_Memory",
+    "Win32_System_SystemServices",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_HiDpi",
+    "Win32_System_Registry",
+    "Win32_Storage_Xps",
+    "Win32_Media_Audio",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_Graphics_GdiPlus",
+    # perry/media — Windows.Media.Playback.MediaPlayer (winrt) for streaming
+    # audio playback (#351).
+    "Media_Playback",
+    "Media_Core",
+    "Foundation",
+    # SystemMediaTransportControls / DisplayUpdater / MusicDisplayProperties
+    # (#367 — volume HUD media tile, headphone media keys, Edge Now Playing).
+    "Media",
+    "Storage_Streams",
+] }

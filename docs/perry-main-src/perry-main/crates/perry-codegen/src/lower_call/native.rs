@@ -1,0 +1,1278 @@
+//! Native-method-call dispatcher: `lower_native_method_call`.
+//!
+//! Tier 2.2 follow-up (v0.5.340). The 805-LOC dispatcher routes
+//! `obj.method(args)` calls against native modules (mysql2, pg, redis,
+//! mongo, ws, fastify, fetch, perry/ui, perry/system, perry/i18n,
+//! perry/plugin, AbortController, …) to their runtime FFI symbols. It
+//! also handles a handful of receiver-less perry/ui forms (`Text(...)`,
+//! `Button(...)`) that previously routed here before the v0.5.10
+//! perry-ui table extraction.
+//!
+//! 14 helper cross-references reach back into the parent module via
+//! `super::` (perry_*_table_lookup family, native_module_lookup,
+//! lower_perry_ui_table_call, lower_fetch_native_method,
+//! lower_abort_controller_call, lower_notification_schedule, …).
+//! All were bumped from private `fn` to `pub(super) fn` in this PR.
+
+use anyhow::{bail, Result};
+use perry_dispatch::{ArgKind as UiArgKind, ReturnKind as UiReturnKind};
+use perry_hir::Expr;
+
+use crate::expr::{lower_expr, nanbox_pointer_inline, unbox_to_i64, FnCtx};
+use crate::nanbox::{double_literal, POINTER_MASK_I64};
+use crate::types::{DOUBLE, I64};
+
+use super::{
+    apply_inline_style, collect_closure_introduced_ids, extract_options_fields,
+    find_outer_writes_stmt, get_raw_string_ptr, lower_fetch_native_method,
+    lower_native_module_dispatch, lower_notification_schedule, lower_perry_ui_table_call,
+    native_module_lookup, perry_i18n_table_lookup, perry_media_table_lookup,
+    perry_plugin_instance_method_lookup, perry_plugin_table_lookup, perry_system_table_lookup,
+    perry_ui_instance_method_lookup, perry_ui_table_lookup, perry_updater_table_lookup,
+};
+
+/// Apply a perry/tui Box style options object — recognized as a
+/// trailing arg in `Box({ flexDirection: "row", gap: 1 }, [children])`
+/// — by emitting per-field `js_perry_tui_box_set_*` FFI calls. The
+/// parent handle is reloaded from `parent_slot` for each setter so
+/// inter-call SSA isn't an issue. Unknown fields are silently dropped
+/// (forward-compat).
+fn apply_box_style(ctx: &mut FnCtx<'_>, parent_slot: &str, style_arg: &Expr) -> anyhow::Result<()> {
+    let Some(props) = extract_options_fields(ctx, style_arg) else {
+        return Ok(());
+    };
+    for (key, val) in &props {
+        // Reload parent handle each iteration so the SSA name is
+        // valid in the current block (apply_inline_style does the
+        // same thing). The slot holds a raw i64 handle now (see the
+        // Box recognizer's call to js_perry_tui_box) so no unbox.
+        let blk = ctx.block();
+        let parent_handle = blk.load(I64, parent_slot);
+        match key.as_str() {
+            "flexDirection" => {
+                let s = get_raw_string_ptr(ctx, val)?;
+                ctx.pending_declares.push((
+                    "js_perry_tui_box_set_flex_direction".to_string(),
+                    DOUBLE,
+                    vec![I64, I64],
+                ));
+                ctx.block().call(
+                    DOUBLE,
+                    "js_perry_tui_box_set_flex_direction",
+                    &[(I64, &parent_handle), (I64, &s)],
+                );
+            }
+            "justifyContent" => {
+                let s = get_raw_string_ptr(ctx, val)?;
+                ctx.pending_declares.push((
+                    "js_perry_tui_box_set_justify_content".to_string(),
+                    DOUBLE,
+                    vec![I64, I64],
+                ));
+                ctx.block().call(
+                    DOUBLE,
+                    "js_perry_tui_box_set_justify_content",
+                    &[(I64, &parent_handle), (I64, &s)],
+                );
+            }
+            "alignItems" => {
+                let s = get_raw_string_ptr(ctx, val)?;
+                ctx.pending_declares.push((
+                    "js_perry_tui_box_set_align_items".to_string(),
+                    DOUBLE,
+                    vec![I64, I64],
+                ));
+                ctx.block().call(
+                    DOUBLE,
+                    "js_perry_tui_box_set_align_items",
+                    &[(I64, &parent_handle), (I64, &s)],
+                );
+            }
+            "gap" => {
+                let v = lower_expr(ctx, val)?;
+                ctx.pending_declares.push((
+                    "js_perry_tui_box_set_gap".to_string(),
+                    DOUBLE,
+                    vec![I64, DOUBLE],
+                ));
+                ctx.block().call(
+                    DOUBLE,
+                    "js_perry_tui_box_set_gap",
+                    &[(I64, &parent_handle), (DOUBLE, &v)],
+                );
+            }
+            "padding" => {
+                let v = lower_expr(ctx, val)?;
+                ctx.pending_declares.push((
+                    "js_perry_tui_box_set_padding".to_string(),
+                    DOUBLE,
+                    vec![I64, DOUBLE],
+                ));
+                ctx.block().call(
+                    DOUBLE,
+                    "js_perry_tui_box_set_padding",
+                    &[(I64, &parent_handle), (DOUBLE, &v)],
+                );
+            }
+            "width" => {
+                let v = lower_expr(ctx, val)?;
+                ctx.pending_declares.push((
+                    "js_perry_tui_box_set_width".to_string(),
+                    DOUBLE,
+                    vec![I64, DOUBLE],
+                ));
+                ctx.block().call(
+                    DOUBLE,
+                    "js_perry_tui_box_set_width",
+                    &[(I64, &parent_handle), (DOUBLE, &v)],
+                );
+            }
+            "height" => {
+                let v = lower_expr(ctx, val)?;
+                ctx.pending_declares.push((
+                    "js_perry_tui_box_set_height".to_string(),
+                    DOUBLE,
+                    vec![I64, DOUBLE],
+                ));
+                ctx.block().call(
+                    DOUBLE,
+                    "js_perry_tui_box_set_height",
+                    &[(I64, &parent_handle), (DOUBLE, &v)],
+                );
+            }
+            "flexGrow" => {
+                let v = lower_expr(ctx, val)?;
+                ctx.pending_declares.push((
+                    "js_perry_tui_box_set_flex_grow".to_string(),
+                    DOUBLE,
+                    vec![I64, DOUBLE],
+                ));
+                ctx.block().call(
+                    DOUBLE,
+                    "js_perry_tui_box_set_flex_grow",
+                    &[(I64, &parent_handle), (DOUBLE, &v)],
+                );
+            }
+            _ => {} // Unknown field — silently drop for forward-compat.
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn lower_native_method_call(
+    ctx: &mut FnCtx<'_>,
+    module: &str,
+    class_name: Option<&str>,
+    method: &str,
+    object: Option<&Expr>,
+    args: &[Expr],
+) -> Result<String> {
+    // Web Fetch API dispatch — Response / Headers / Request / static
+    // factories. Handled before the receiver-less early-out so that
+    // `Response.json(v)` (object.is_none()) finds its runtime function.
+    if let Some(val) = lower_fetch_native_method(ctx, module, method, object, args)? {
+        return Ok(val);
+    }
+
+    // `perry/i18n.t(key, params?)` is the i18n entry point. The
+    // perry-transform i18n pass already replaced the first arg with
+    // an `Expr::I18nString { key, string_idx, params, ... }` containing
+    // all the metadata the codegen needs to resolve the translation
+    // at compile time. The wrapping `t()` call is therefore identity:
+    // we just lower `args[0]` (the I18nString) and return its value.
+    // Without this case, the receiver-less early-out below would
+    // discard the I18nString and return `double 0.0`, which prints
+    // as `0` instead of the translated text — the symptom that broke
+    // the v0.5.7 i18n test before this fix landed.
+    if module == "perry/i18n" && method == "t" && object.is_none() {
+        if let Some(first) = args.first() {
+            return lower_expr(ctx, first);
+        }
+    }
+
+    // `perry/ui.App({ title, width, height, body, icon? })` — minimum-viable
+    // dispatch so a perry/ui app actually launches an NSApplication and
+    // shows a window. Pre-v0.5.10 this fell into the receiver-less early-
+    // out below and returned `double 0.0`, so the program completed
+    // without entering the AppKit run loop — mango compiled cleanly but
+    // exited immediately on launch with no output. This is the smallest
+    // dispatch that proves the linking + runtime + Mach-O code path works
+    // end to end. Other perry/ui constructors (Text, Button, VStack,
+    // HStack, etc.) are NOT dispatched yet so the body is the
+    // zero-sentinel — the window appears with the right title/size but
+    // no widget tree. Full widget dispatch is a separate followup.
+    // perry/tui Box — TS shapes:
+    //   Box()                                — empty container
+    //   Box([child, …])                      — children array (Phase 1)
+    //   Box({ flexDirection, gap, … }, [child, …])  — style + children (Phase 3)
+    //   Box({ flexDirection, gap, … })       — style, no children
+    //
+    // Detect which by examining args[0]: an array → children-only;
+    // an object/object-shape → style; followed by an array → children.
+    // Mirrors the perry/ui VStack pattern: create handle, optionally
+    // emit per-style-field setter calls, then iterate the children
+    // array calling add_child per element. Bare `Box()` falls through
+    // to the regular PERRY_UI_TABLE dispatch (just emits js_perry_tui_box).
+    // (#358 Phases 1 + 3.)
+    if module == "perry/tui" && method == "Box" && object.is_none() && !args.is_empty() {
+        // Note: js_perry_tui_box returns I64 (raw handle); the
+        // dispatch table's NR_PTR contract NaN-boxes it for the
+        // outer call. The special-case path here mirrors that — call
+        // returns I64, store in an I64 slot, NaN-box at the very end
+        // when handing off to the caller.
+        ctx.pending_declares
+            .push(("js_perry_tui_box".to_string(), I64, vec![]));
+        ctx.pending_declares.push((
+            "js_perry_tui_box_add_child".to_string(),
+            DOUBLE,
+            vec![I64, I64],
+        ));
+        let blk = ctx.block();
+        let parent_handle = blk.call(I64, "js_perry_tui_box", &[]);
+        let parent_slot = ctx.func.alloca_entry(I64);
+        ctx.block().store(I64, &parent_handle, &parent_slot);
+
+        // Determine which arg is the style-options object and which
+        // is the children array. The classification is structural —
+        // arrays go to children, object-literals go to style.
+        let mut style_arg: Option<&Expr> = None;
+        let mut children_arg: Option<&Expr> = None;
+        for arg in args.iter() {
+            match arg {
+                Expr::Array(_) | Expr::ArraySpread(_) => children_arg = Some(arg),
+                _ => {
+                    if style_arg.is_none() {
+                        style_arg = Some(arg);
+                    }
+                }
+            }
+        }
+
+        // Emit per-field style setter calls if a style object was
+        // recognized. Each known field maps to one js_perry_tui_box_set_*
+        // FFI; unknown fields are silently dropped (forward-compat
+        // for future style props).
+        if let Some(style) = style_arg {
+            apply_box_style(ctx, &parent_slot, style)?;
+        }
+
+        if let Some(children_expr) = children_arg {
+            let elements_owned: Option<Vec<Expr>> = match children_expr {
+                Expr::Array(elems) => Some(elems.clone()),
+                _ => None,
+            };
+            if let Some(elements) = elements_owned {
+                for child in &elements {
+                    let child_box = lower_expr(ctx, child)?;
+                    let blk = ctx.block();
+                    let child_handle = unbox_to_i64(blk, &child_box);
+                    let parent_reload = blk.load(I64, &parent_slot);
+                    blk.call_void(
+                        "js_perry_tui_box_add_child",
+                        &[(I64, &parent_reload), (I64, &child_handle)],
+                    );
+                }
+            } else {
+                let _ = lower_expr(ctx, children_expr)?;
+            }
+        }
+
+        let blk = ctx.block();
+        let parent_final = blk.load(I64, &parent_slot);
+        // NaN-box the handle into a POINTER-tagged f64 — same as the
+        // dispatch table's NR_PTR contract.
+        return Ok(nanbox_pointer_inline(blk, &parent_final));
+    }
+
+    // perry/ui VStack/HStack — special-case because the TS shape is
+    // `VStack(spacing, [child1, child2, ...])` (or just `VStack([...])`),
+    // but the runtime takes only `(spacing) -> handle` and children get
+    // added one by one via `perry_ui_widget_add_child`. We can't express
+    // this with the per-method table because it's variadic in arg shape
+    // *and* needs sequential calls per child.
+    if module == "perry/ui" && (method == "VStack" || method == "HStack") && object.is_none() {
+        let runtime_create = if method == "VStack" {
+            "perry_ui_vstack_create"
+        } else {
+            "perry_ui_hstack_create"
+        };
+        // First arg may be the spacing number OR the children array
+        // (when the user calls `VStack([children])` without an explicit
+        // spacing). Detect which by checking the type.
+        let (spacing_d, children_idx) = match args.first() {
+            Some(Expr::Array(_)) | Some(Expr::ArraySpread(_)) => ("8.0".to_string(), 0),
+            Some(other) => {
+                // Could be a number (spacing) — lower it. The children
+                // are then in args[1] (if present).
+                let v = lower_expr(ctx, other)?;
+                (v, 1)
+            }
+            None => ("8.0".to_string(), 0),
+        };
+        ctx.pending_declares
+            .push((runtime_create.to_string(), I64, vec![DOUBLE]));
+        let blk = ctx.block();
+        let parent_handle = blk.call(I64, runtime_create, &[(DOUBLE, &spacing_d)]);
+        // Stash so add_child has it; we'll need to reload later because
+        // calls between here and the loop may invalidate `parent_handle`'s
+        // SSA name in subsequent blocks.
+        let parent_slot = ctx.func.alloca_entry(I64);
+        ctx.block().store(I64, &parent_handle, &parent_slot);
+
+        // Walk the children array (if present). For each element, lower
+        // to a JSValue, unbox to widget handle, call
+        // `perry_ui_widget_add_child(parent, child)`.
+        ctx.pending_declares.push((
+            "perry_ui_widget_add_child".to_string(),
+            crate::types::VOID,
+            vec![I64, I64],
+        ));
+        if let Some(children_expr) = args.get(children_idx) {
+            let elements_owned: Option<Vec<Expr>> = match children_expr {
+                Expr::Array(elems) => Some(elems.clone()),
+                _ => None,
+            };
+            if let Some(elements) = elements_owned {
+                for child in &elements {
+                    let child_box = lower_expr(ctx, child)?;
+                    let blk = ctx.block();
+                    let child_handle = unbox_to_i64(blk, &child_box);
+                    let parent_reload = blk.load(I64, &parent_slot);
+                    blk.call_void(
+                        "perry_ui_widget_add_child",
+                        &[(I64, &parent_reload), (I64, &child_handle)],
+                    );
+                }
+            } else {
+                // Children expression isn't a literal array — lower for
+                // side effects so closures still get collected.
+                let _ = lower_expr(ctx, children_expr)?;
+            }
+        }
+
+        // Issue #185 Phase C step 5: optional inline `style: { ... }`
+        // arg AFTER the children array. Position depends on whether
+        // spacing was passed first:
+        //   VStack(children, style?)              children_idx=0, style at args[1]
+        //   VStack(spacing, children, style?)     children_idx=1, style at args[2]
+        // `apply_inline_style` no-ops on non-object trailing args, so
+        // the call is safe even when it's accidentally something else.
+        let style_idx = children_idx + 1;
+        if let Some(style_arg) = args.get(style_idx).cloned() {
+            let parent_handle_str = ctx.block().load(I64, &parent_slot);
+            apply_inline_style(ctx, &parent_handle_str, &style_arg)?;
+        }
+
+        let blk = ctx.block();
+        let parent_final = blk.load(I64, &parent_slot);
+        return Ok(nanbox_pointer_inline(blk, &parent_final));
+    }
+
+    // perry/ui ForEach — TS shape is `ForEach(state, (i) => Widget)`. The
+    // runtime's `perry_ui_for_each_init` wants `(container, state, closure)`,
+    // so we synthesize a VStack container, call for_each_init with it, and
+    // return the container handle. Without this special case the call falls
+    // through to the generic dispatch which emits the "method 'ForEach' not
+    // in dispatch table" warning and returns 0/undefined — the outer VStack
+    // then tries to add_child with an invalid handle, AppKit silently fails
+    // to attach the window body, and the process runs but no window shows.
+    if module == "perry/ui" && method == "ForEach" && object.is_none() && args.len() == 2 {
+        ctx.pending_declares
+            .push(("perry_ui_vstack_create".to_string(), I64, vec![DOUBLE]));
+        ctx.pending_declares.push((
+            "perry_ui_for_each_init".to_string(),
+            crate::types::VOID,
+            vec![I64, I64, DOUBLE],
+        ));
+
+        let spacing = "8.0".to_string();
+        let blk = ctx.block();
+        let container = blk.call(I64, "perry_ui_vstack_create", &[(DOUBLE, &spacing)]);
+        let container_slot = ctx.func.alloca_entry(I64);
+        ctx.block().store(I64, &container, &container_slot);
+
+        // args[0]: State handle — NaN-boxed pointer, unbox to i64.
+        let state_box = lower_expr(ctx, &args[0])?;
+        let blk = ctx.block();
+        let state_handle = unbox_to_i64(blk, &state_box);
+
+        // args[1]: render closure — stays as a NaN-boxed f64.
+        let closure_d = lower_expr(ctx, &args[1])?;
+
+        let blk = ctx.block();
+        let container_reload = blk.load(I64, &container_slot);
+        blk.call_void(
+            "perry_ui_for_each_init",
+            &[
+                (I64, &container_reload),
+                (I64, &state_handle),
+                (DOUBLE, &closure_d),
+            ],
+        );
+
+        let blk = ctx.block();
+        let container_final = blk.load(I64, &container_slot);
+        return Ok(nanbox_pointer_inline(blk, &container_final));
+    }
+
+    // perry/ui Text(content, id) — 2-arg form registers the widget in the
+    // per-platform text registry so setText(id, val) can update it later.
+    // The 1-arg form `Text(content)` routes through the PERRY_UI_TABLE entry
+    // (perry_ui_text_create) as normal; only the 2-arg form is intercepted here.
+    if module == "perry/ui" && method == "Text" && object.is_none() && args.len() == 2 {
+        let text_ptr = get_raw_string_ptr(ctx, &args[0])?;
+        let id_ptr = get_raw_string_ptr(ctx, &args[1])?;
+        ctx.pending_declares.push((
+            "perry_ui_text_create_with_id".to_string(),
+            I64,
+            vec![I64, I64],
+        ));
+        let blk = ctx.block();
+        let handle = blk.call(
+            I64,
+            "perry_ui_text_create_with_id",
+            &[(I64, &text_ptr), (I64, &id_ptr)],
+        );
+        // Optional trailing style arg (position 2) — same pattern as Button.
+        if let Some(style_arg) = args.get(2).cloned() {
+            apply_inline_style(ctx, &handle, &style_arg)?;
+        }
+        let blk = ctx.block();
+        return Ok(nanbox_pointer_inline(blk, &handle));
+    }
+
+    // perry/ui Button — TS shape is `Button(label, handler)` where
+    // handler is a closure. The simple positional form is what mango
+    // uses. The Object-config form (`Button(label, { onPress: cb })`)
+    // is a followup.
+    if module == "perry/ui" && method == "Button" && object.is_none() {
+        let label_ptr = if let Some(label) = args.first() {
+            get_raw_string_ptr(ctx, label)?
+        } else {
+            "0".to_string()
+        };
+        let handler_d = if let Some(handler) = args.get(1) {
+            lower_expr(ctx, handler)?
+        } else {
+            "0.0".to_string()
+        };
+        ctx.pending_declares
+            .push(("perry_ui_button_create".to_string(), I64, vec![I64, DOUBLE]));
+        // Scope `blk` so the mutable borrow on `ctx` is released before
+        // we call `apply_inline_style(ctx, ...)`, which re-borrows.
+        let handle = {
+            let blk = ctx.block();
+            blk.call(
+                I64,
+                "perry_ui_button_create",
+                &[(I64, &label_ptr), (DOUBLE, &handler_d)],
+            )
+        };
+
+        // Issue #185 Phase C step 2: optional trailing `style` arg.
+        // `Button(label, onPress, { borderRadius, opacity, ... })`
+        // destructures the StyleProps object at HIR time and emits a
+        // sequence of setter calls against the just-created handle.
+        // Mirrors the v0.5.x `App({ title, width, height, body })` HIR
+        // pass — same `extract_options_fields` helper, same per-key
+        // routing. Step 2 covers single-value scalar props; colors /
+        // padding / shadow / gradient need multi-arg destructure and
+        // land in step 3.
+        if let Some(style_arg) = args.get(2) {
+            apply_inline_style(ctx, &handle, style_arg)?;
+        }
+
+        let blk = ctx.block();
+        return Ok(nanbox_pointer_inline(blk, &handle));
+    }
+
+    // Generic perry/ui receiver-less dispatch via a per-method table.
+    // Constructors and setters that don't need special arg shape handling
+    // (object literals, children arrays, closures stored in side tables)
+    // route through here. Each entry declares the runtime function name
+    // plus the arg coercion + return boxing rules.
+    //
+    // The table covers ~80% of mango's perry/ui surface. Special cases
+    // (App with object literal, VStack/HStack with children array,
+    // Button with optional Object config) are handled in dedicated
+    // arms BELOW so they short-circuit before this table is consulted.
+    //
+    // Extending: add a row to PERRY_UI_TABLE matching the TS method name
+    // to the perry_ui_* runtime function and arg shape. Most setters
+    // follow `(widget, …number args)` and most constructors return a
+    // widget handle that gets NaN-boxed as POINTER on the way out.
+    // perry/ui.showToast(msg) — Phase 2 v3 Option 1. Enqueues `msg`
+    // into the runtime's drain queue; the auto-emitted .ets onClick
+    // pumps the queue into ArkUI's `promptAction.showToast` after the
+    // closure body returns. On non-harmonyos targets the runtime FFI
+    // is still defined (just with empty queue + no consumer) so
+    // cross-platform code compiles, but only harmonyos shows visual
+    // feedback. Future v3 follow-up: route to NSAlert/UIAlertController/
+    // GtkPopover on the desktop UI backends.
+    if module == "perry/ui" && method == "showToast" && object.is_none() {
+        if args.is_empty() {
+            return Ok(double_literal(f64::from_bits(0x7FFC_0000_0000_0001)));
+        }
+        let msg_d = lower_expr(ctx, &args[0])?;
+        ctx.pending_declares.push((
+            "perry_arkts_show_toast".to_string(),
+            crate::types::VOID,
+            vec![DOUBLE],
+        ));
+        let blk = ctx.block();
+        blk.call_void("perry_arkts_show_toast", &[(DOUBLE, &msg_d)]);
+        return Ok(double_literal(f64::from_bits(0x7FFC_0000_0000_0001)));
+    }
+
+    // perry/ui.setText(id, value) — Phase 2 v3 Option 2 reactive Text.
+    // Enqueues a (id, value) update; the auto-emitted .ets onClick
+    // pumps the queue into the matching `@State text_<id>` after the
+    // closure body returns. Same drain-pattern shape as showToast.
+    if module == "perry/ui" && method == "setText" && object.is_none() {
+        if args.len() < 2 {
+            return Ok(double_literal(f64::from_bits(0x7FFC_0000_0000_0001)));
+        }
+        let id_d = lower_expr(ctx, &args[0])?;
+        let val_d = lower_expr(ctx, &args[1])?;
+        ctx.pending_declares.push((
+            "perry_arkts_set_text".to_string(),
+            crate::types::VOID,
+            vec![DOUBLE, DOUBLE],
+        ));
+        let blk = ctx.block();
+        blk.call_void("perry_arkts_set_text", &[(DOUBLE, &id_d), (DOUBLE, &val_d)]);
+        return Ok(double_literal(f64::from_bits(0x7FFC_0000_0000_0001)));
+    }
+
+    // perry/arkts: HarmonyOS Phase 2 v2 callback bridge. Synthetic module
+    // injected by the harvest pass (`compile.rs::emit_index_ets`) — never
+    // user-authored. `registerCallback(idx, closure)` lowers to a call to
+    // the runtime FFI `perry_arkts_register_callback(i64, f64)` which
+    // stores the closure pointer in a slot table that NAPI's
+    // `invokeCallback(idx)` dispatches against on ArkUI tap events.
+    if module == "perry/arkts" && method == "registerCallback" && object.is_none() {
+        if args.len() != 2 {
+            bail!(
+                "perry/arkts.registerCallback expects (idx, closure), got {} args",
+                args.len()
+            );
+        }
+        let idx_d = lower_expr(ctx, &args[0])?;
+        let closure_d = lower_expr(ctx, &args[1])?;
+        ctx.pending_declares.push((
+            "perry_arkts_register_callback".to_string(),
+            crate::types::VOID,
+            vec![I64, DOUBLE],
+        ));
+        let blk = ctx.block();
+        let idx_i64 = blk.fptosi(DOUBLE, &idx_d, I64);
+        blk.call_void(
+            "perry_arkts_register_callback",
+            &[(I64, &idx_i64), (DOUBLE, &closure_d)],
+        );
+        return Ok(double_literal(f64::from_bits(0x7FFC_0000_0000_0001)));
+    }
+
+    // perry/system dispatch: audioStart, audioGetLevel, getDeviceModel, etc.
+    if module == "perry/system" && object.is_none() {
+        if method == "notificationSchedule" {
+            return lower_notification_schedule(ctx, args);
+        }
+        if let Some(sig) = perry_system_table_lookup(method) {
+            return lower_perry_ui_table_call(ctx, sig, args);
+        }
+    }
+
+    // perry/media dispatch: createPlayer, play, pause, seek, setVolume,
+    // onStateChange, onTimeUpdate, setNowPlaying, destroy. Streaming
+    // media playback backed by AVPlayer (Apple), MediaPlayer/JNI
+    // (Android), GStreamer (GTK4/Linux), Media Foundation (Windows).
+    if module == "perry/media" && object.is_none() {
+        if let Some(sig) = perry_media_table_lookup(method) {
+            return lower_perry_ui_table_call(ctx, sig, args);
+        }
+        bail!(
+            "perry/media: '{}' is not a known function (args: {}). \
+             Check types/perry/media/index.d.ts for the supported API surface.",
+            method,
+            args.len()
+        );
+    }
+
+    // perry/i18n format wrappers: Currency, Percent, FormatNumber, ShortDate,
+    // LongDate, FormatTime, Raw. Without this, the call falls through to the
+    // receiver-less early-out and returns NaN-boxed `undefined` (issue #188).
+    // `t()` is dispatched separately near the top of this function.
+    if module == "perry/i18n" && object.is_none() {
+        if let Some(sig) = perry_i18n_table_lookup(method) {
+            return lower_perry_ui_table_call(ctx, sig, args);
+        }
+    }
+
+    // perry/plugin dispatch: loadPlugin, listPlugins, emitHook, etc.
+    if module == "perry/plugin" && object.is_none() {
+        if let Some(sig) = perry_plugin_table_lookup(method) {
+            return lower_perry_ui_table_call(ctx, sig, args);
+        }
+        bail!(
+            "perry/plugin: '{}' is not a known function (args: {}). \
+             Check types/perry/plugin/index.d.ts for the supported API surface.",
+            method,
+            args.len()
+        );
+    }
+
+    // perry/updater dispatch: compareVersions, verifyHash, verifySignature,
+    // sentinel state helpers, install, relaunch.
+    if module == "perry/updater" && object.is_none() {
+        if let Some(sig) = perry_updater_table_lookup(method) {
+            return lower_perry_ui_table_call(ctx, sig, args);
+        }
+        bail!(
+            "perry/updater: '{}' is not a known function (args: {}). \
+             Check types/perry/updater/index.d.ts for the supported API surface.",
+            method,
+            args.len()
+        );
+    }
+
+    // Phase 2 v3.3: `Text(content, id)` reactive form. The 1-arg
+    // `Text(content)` row in PERRY_UI_TABLE doesn't know about the
+    // optional `id` second arg — pre-fix the table-call's "if args.len()
+    // == sig.args.len() + 1 ⇒ inline_style_arg" path absorbed it as a
+    // would-be style object, then `apply_inline_style` silently no-op'd
+    // because strings aren't object literals. Effect: id was dropped on
+    // the floor and `setText("counter", ...)` had nothing to look up.
+    //
+    // Fix: detect Text-with-id BEFORE the table lookup, lower the
+    // create call manually (mirroring the table-call shape), then
+    // emit `perry_arkts_register_text_id(handle, id)` so the platform
+    // UI lib can map id → widget handle. On harmonyos, codegen-arkts
+    // emits `@State text_<id>` directly into the .ets and the
+    // register_text_id call is a runtime no-op (see
+    // perry-runtime/src/ui_text_registry.rs).
+    if module == "perry/ui" && method == "Text" && object.is_none() && args.len() == 2 {
+        let content_ptr = get_raw_string_ptr(ctx, &args[0])?;
+        ctx.pending_declares
+            .push(("perry_ui_text_create".to_string(), I64, vec![I64]));
+        let handle = {
+            let blk = ctx.block();
+            blk.call(I64, "perry_ui_text_create", &[(I64, &content_ptr)])
+        };
+        // Lower the id arg as a regular NaN-boxed JS value so the
+        // runtime's `decode_jsvalue_string` can read it through the
+        // standard StringHeader path (handles SSO + heap strings the
+        // same way, and matches the harmonyos drain-queue contract).
+        let id_d = lower_expr(ctx, &args[1])?;
+        ctx.pending_declares.push((
+            "perry_arkts_register_text_id".to_string(),
+            crate::types::VOID,
+            vec![I64, DOUBLE],
+        ));
+        let blk = ctx.block();
+        blk.call_void(
+            "perry_arkts_register_text_id",
+            &[(I64, &handle), (DOUBLE, &id_d)],
+        );
+        return Ok(nanbox_pointer_inline(blk, &handle));
+    }
+
+    if module == "perry/ui"
+        && object.is_none()
+        && method != "App"
+        && method != "VStack"
+        && method != "HStack"
+    {
+        if let Some(sig) = perry_ui_table_lookup(method) {
+            return lower_perry_ui_table_call(ctx, sig, args);
+        }
+        // Fail fast at compile time so a missing/misspelled method
+        // surfaces as an error instead of silently returning 0.0 —
+        // which used to compile, link, and run with a zero widget
+        // handle (no window, or null-pointer crash at the caller).
+        bail!(
+            "perry/ui: '{}' is not a known function (args: {}). \
+             Check the spelling and consult types/perry/ui/index.d.ts \
+             for the supported API surface.",
+            method,
+            args.len()
+        );
+    }
+
+    if module == "perry/ui" && method == "App" && object.is_none() {
+        if args.len() != 1 {
+            bail!(
+                "perry/ui: App(...) takes a single config object literal like \
+                 `App({{ title, width, height, body }})`, got {} argument(s). \
+                 There is no `App(title, builder)` callback form.",
+                args.len()
+            );
+        }
+        let Some(props) = extract_options_fields(ctx, &args[0]) else {
+            bail!(
+                "perry/ui: App(...) requires a config object literal. Use \
+                 `App({{ title: ..., width: ..., height: ..., body: ... }})` \
+                 (see types/perry/ui/index.d.ts)."
+            );
+        };
+        let mut title_ptr: String = "0".to_string();
+        let mut width_d: String = "1024.0".to_string();
+        let mut height_d: String = "768.0".to_string();
+        let mut body_handle: String = "0".to_string();
+        let mut icon_ptr: Option<String> = None;
+        for (key, val) in &props {
+            match key.as_str() {
+                "title" => {
+                    let v = lower_expr(ctx, val)?;
+                    let blk = ctx.block();
+                    title_ptr = unbox_to_i64(blk, &v);
+                }
+                "width" => {
+                    width_d = lower_expr(ctx, val)?;
+                }
+                "height" => {
+                    height_d = lower_expr(ctx, val)?;
+                }
+                "body" => {
+                    let v = lower_expr(ctx, val)?;
+                    let blk = ctx.block();
+                    body_handle = unbox_to_i64(blk, &v);
+                }
+                "icon" => {
+                    let v = lower_expr(ctx, val)?;
+                    let blk = ctx.block();
+                    icon_ptr = Some(unbox_to_i64(blk, &v));
+                }
+                _ => {
+                    let _ = lower_expr(ctx, val)?;
+                }
+            }
+        }
+        ctx.pending_declares.push((
+            "perry_ui_app_create".to_string(),
+            I64,
+            vec![I64, DOUBLE, DOUBLE],
+        ));
+        ctx.pending_declares.push((
+            "perry_ui_app_set_icon".to_string(),
+            crate::types::VOID,
+            vec![I64],
+        ));
+        ctx.pending_declares.push((
+            "perry_ui_app_set_body".to_string(),
+            crate::types::VOID,
+            vec![I64, I64],
+        ));
+        ctx.pending_declares.push((
+            "perry_ui_app_run".to_string(),
+            crate::types::VOID,
+            vec![I64],
+        ));
+        let blk = ctx.block();
+        let app_handle = blk.call(
+            I64,
+            "perry_ui_app_create",
+            &[(I64, &title_ptr), (DOUBLE, &width_d), (DOUBLE, &height_d)],
+        );
+        if let Some(icon) = icon_ptr {
+            blk.call_void("perry_ui_app_set_icon", &[(I64, &icon)]);
+        }
+        blk.call_void(
+            "perry_ui_app_set_body",
+            &[(I64, &app_handle), (I64, &body_handle)],
+        );
+        blk.call_void("perry_ui_app_run", &[(I64, &app_handle)]);
+        return Ok(double_literal(0.0));
+    }
+
+    // fs module functions: readdirSync, statSync, mkdirSync, etc.
+    // These are receiver-less NativeMethodCalls (`import { readdirSync }
+    // from 'fs'` → `NativeMethodCall { module: "fs", object: None }`).
+    // Dispatch before the catch-all so they call the runtime instead of
+    // returning TAG_UNDEFINED.
+    if module == "fs" && object.is_none() {
+        match method {
+            "readdirSync" if !args.is_empty() => {
+                let p = lower_expr(ctx, &args[0])?;
+                let blk = ctx.block();
+                let raw = blk.call(DOUBLE, "js_fs_readdir_sync", &[(DOUBLE, &p)]);
+                let raw_bits = blk.bitcast_double_to_i64(&raw);
+                return Ok(nanbox_pointer_inline(blk, &raw_bits));
+            }
+            "statSync" if !args.is_empty() => {
+                let p = lower_expr(ctx, &args[0])?;
+                return Ok(ctx.block().call(DOUBLE, "js_fs_stat_sync", &[(DOUBLE, &p)]));
+            }
+            "renameSync" if args.len() >= 2 => {
+                let from = lower_expr(ctx, &args[0])?;
+                let to = lower_expr(ctx, &args[1])?;
+                ctx.block()
+                    .call_void("js_fs_rename_sync", &[(DOUBLE, &from), (DOUBLE, &to)]);
+                return Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));
+            }
+            "unlinkSync" if !args.is_empty() => {
+                let p = lower_expr(ctx, &args[0])?;
+                ctx.block().call_void("js_fs_unlink_sync", &[(DOUBLE, &p)]);
+                return Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));
+            }
+            "mkdirSync" if !args.is_empty() => {
+                let p = lower_expr(ctx, &args[0])?;
+                ctx.block().call_void("js_fs_mkdir_sync", &[(DOUBLE, &p)]);
+                return Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));
+            }
+            "rmdirSync" if !args.is_empty() => {
+                let p = lower_expr(ctx, &args[0])?;
+                ctx.block().call_void("js_fs_rmdir_sync", &[(DOUBLE, &p)]);
+                return Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));
+            }
+            "copyFileSync" if args.len() >= 2 => {
+                let src = lower_expr(ctx, &args[0])?;
+                let dst = lower_expr(ctx, &args[1])?;
+                ctx.block()
+                    .call_void("js_fs_copy_file_sync", &[(DOUBLE, &src), (DOUBLE, &dst)]);
+                return Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));
+            }
+            "chmodSync" if args.len() >= 2 => {
+                let p = lower_expr(ctx, &args[0])?;
+                let m = lower_expr(ctx, &args[1])?;
+                ctx.block()
+                    .call_void("js_fs_chmod_sync", &[(DOUBLE, &p), (DOUBLE, &m)]);
+                return Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));
+            }
+            _ => {
+                // Fall through — readFileSync/writeFileSync/existsSync/etc.
+                // are handled as dedicated HIR Expr variants, not
+                // NativeMethodCall. Warn on truly unhandled ones.
+                eprintln!(
+                    "perry-codegen: unhandled fs.{}() NativeMethodCall ({})",
+                    method,
+                    args.len()
+                );
+            }
+        }
+    }
+
+    // process module functions: cwd / uptime / memoryUsage / versions
+    // accessed as destructured imports. `import { cwd } from 'node:process'`
+    // → NativeMethodCall { module: "process", method: "cwd", object: None }.
+    // The implicit-global form `process.cwd()` is already lowered to
+    // dedicated HIR variants (Expr::ProcessCwd etc) in
+    // perry-hir/src/lower/expr_call.rs:262, so the runtime helpers
+    // (js_process_cwd / js_process_uptime / js_process_versions /
+    // js_process_memory_usage) already exist — this arm just routes the
+    // destructured-import shape to the same helpers. Closes #360 item #2's
+    // dispatch gap (the warning fix alone would link cwd() but return
+    // undefined silently — worse UX than the original "Could not resolve").
+    if module == "process" && object.is_none() {
+        match method {
+            "cwd" => {
+                let blk = ctx.block();
+                let h = blk.call(I64, "js_process_cwd", &[]);
+                return Ok(crate::expr::nanbox_string_inline(blk, &h));
+            }
+            "uptime" => {
+                return Ok(ctx.block().call(DOUBLE, "js_process_uptime", &[]));
+            }
+            "memoryUsage" => {
+                return Ok(ctx.block().call(DOUBLE, "js_process_memory_usage", &[]));
+            }
+            _ => {
+                // Unknown process method — fall through to the generic
+                // dispatch which will emit a diagnostic if no signature
+                // matches. Likely candidates not wired here: nextTick
+                // (needs a callback arg), exit (takes a code), kill,
+                // hrtime. Each is its own follow-up under #360.
+            }
+        }
+    }
+
+    // Generic native module dispatch (receiver-less): fastify, mysql2,
+    // ws, pg, ioredis, mongodb, better-sqlite3, etc. These were in the
+    // old Cranelift codegen's dispatch table but lost in the v0.5.0
+    // LLVM cutover.
+    if object.is_none() {
+        if let Some(sig) = native_module_lookup(module, false, method, class_name) {
+            // perry/thread thread-safety check: the closure passed to
+            // parallelMap / parallelFilter / spawn must not write to any
+            // variable declared outside its own body. Each worker thread
+            // gets its own deep-copied snapshot of ordinary captures, and
+            // module-level variables live in global slots that would race
+            // across workers — either way, writes are silently lost or
+            // corrupted relative to user expectations. Enforce at compile
+            // time so the docs' promise is real.
+            //
+            // Note we can't rely on the closure's `mutable_captures` field
+            // alone: the HIR filters module-level IDs out of `captures`
+            // via `filter_module_level_captures` (see lower.rs:457), so a
+            // top-level `let counter = 0; parallelMap(data, () => counter++)`
+            // ends up with `captures: [], mutable_captures: []` even though
+            // the body obviously writes to `counter`. Instead, walk the
+            // body ourselves and flag any LocalSet/Update whose target
+            // isn't a parameter or a `let` introduced inside the body.
+            if module == "perry/thread" {
+                let closure_arg = match method {
+                    "parallelMap" | "parallelFilter" => args.get(1),
+                    "spawn" => args.first(),
+                    _ => None,
+                };
+                if let Some(callback) = closure_arg {
+                    match callback {
+                        Expr::Closure { params, body, .. } => {
+                            let mut inner_ids: std::collections::HashSet<perry_types::LocalId> =
+                                params.iter().map(|p| p.id).collect();
+                            for stmt in body {
+                                collect_closure_introduced_ids(stmt, &mut inner_ids);
+                            }
+                            let mut outer_writes: Vec<perry_types::LocalId> = Vec::new();
+                            for stmt in body {
+                                find_outer_writes_stmt(stmt, &inner_ids, &mut outer_writes);
+                            }
+                            if let Some(&first_outer) = outer_writes.first() {
+                                anyhow::bail!(
+                                    "perry/thread: closure passed to `{}` writes to outer variable (LocalId {}) — \
+                                     this is not allowed because each worker thread receives a deep-copied \
+                                     snapshot of captured values (and module-level slots are not shared across \
+                                     workers in the way ordinary TS globals appear to be), so writes would be \
+                                     silently lost or corrupted relative to user expectations. Return values \
+                                     from the closure and aggregate them on the main thread instead. \
+                                     See docs/src/threading/overview.md#no-shared-mutable-state.",
+                                    method, first_outer,
+                                );
+                            }
+                        }
+                        // Named-function callback bypass: `function worker(n) { counter++; }
+                        // parallelMap(xs, worker)` is semantically identical to the inline-
+                        // closure form we check above, but we don't have the callee's HIR
+                        // body accessible from FnCtx (only `func_names: FuncId -> String`,
+                        // not the full function table). Bail with a helpful diagnostic
+                        // pointing the user at the inline-closure workaround. Pure
+                        // function workers work fine when wrapped (`(x) => worker(x)`);
+                        // this just closes the compile-time safety bypass that silently
+                        // let outer-writing named functions through.
+                        Expr::FuncRef(_) | Expr::LocalGet(_) | Expr::ExternFuncRef { .. } => {
+                            anyhow::bail!(
+                                "perry/thread: `{}` callback must be an inline arrow/closure, not a \
+                                 named function reference. Compile-time thread-safety analysis can only \
+                                 inspect inline closures today; a named function could write to outer \
+                                 variables which would be silently lost on the deep-copy worker boundary. \
+                                 Workaround: wrap the named function in an inline closure — \
+                                 `{}(xs, (x) => myFn(x))`. See docs/src/threading/overview.md#no-shared-mutable-state.",
+                                method, method,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            return lower_native_module_dispatch(ctx, sig, None, args);
+        }
+    }
+
+    // Receiver-less native method calls (e.g. plugin::setConfig(...)
+    // as a static module function): lower args for side effects and
+    // return TAG_UNDEFINED. Using TAG_UNDEFINED (not 0.0) so that
+    // downstream .length reads return 0 instead of crashing (the
+    // inline .length guard checks ptr < 4096, and TAG_UNDEFINED's
+    // lower 48 bits = 1).
+    let Some(recv) = object else {
+        for a in args {
+            let _ = lower_expr(ctx, a)?;
+        }
+        return Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));
+    };
+    let _ = (module, method); // shut up unused warnings on the early-out path
+
+    // perry/ui instance method calls: `windowHandle.show()`, `windowHandle.setBody(w)`, etc.
+    // The HIR produces these with `object: Some(handle)` and `module: "perry/ui"`.
+    // Lower the receiver to get the widget/window handle, then dispatch.
+    if module == "perry/ui" {
+        let recv_val = lower_expr(ctx, recv)?;
+        let blk = ctx.block();
+        let handle = unbox_to_i64(blk, &recv_val);
+        if let Some(sig) = perry_ui_instance_method_lookup(method) {
+            // Build args: handle is the first arg, then the call args.
+            let mut llvm_args: Vec<(crate::types::LlvmType, String)> =
+                Vec::with_capacity(1 + args.len());
+            let mut runtime_param_types: Vec<crate::types::LlvmType> =
+                Vec::with_capacity(1 + args.len());
+            llvm_args.push((I64, handle));
+            runtime_param_types.push(I64);
+            for (kind, arg) in sig.args.iter().zip(args.iter()) {
+                match kind {
+                    UiArgKind::Widget => {
+                        let v = lower_expr(ctx, arg)?;
+                        let blk = ctx.block();
+                        let h = unbox_to_i64(blk, &v);
+                        llvm_args.push((I64, h));
+                        runtime_param_types.push(I64);
+                    }
+                    UiArgKind::Str => {
+                        let h = get_raw_string_ptr(ctx, arg)?;
+                        llvm_args.push((I64, h));
+                        runtime_param_types.push(I64);
+                    }
+                    UiArgKind::F64 => {
+                        let v = lower_expr(ctx, arg)?;
+                        llvm_args.push((DOUBLE, v));
+                        runtime_param_types.push(DOUBLE);
+                    }
+                    UiArgKind::Closure => {
+                        let v = lower_expr(ctx, arg)?;
+                        llvm_args.push((DOUBLE, v));
+                        runtime_param_types.push(DOUBLE);
+                    }
+                    UiArgKind::I64Raw => {
+                        let v = lower_expr(ctx, arg)?;
+                        let blk = ctx.block();
+                        let i = blk.fptosi(DOUBLE, &v, I64);
+                        llvm_args.push((I64, i));
+                        runtime_param_types.push(I64);
+                    }
+                }
+            }
+            let return_type = match sig.ret {
+                UiReturnKind::Widget | UiReturnKind::I64AsF64 => I64,
+                UiReturnKind::F64 => DOUBLE,
+                UiReturnKind::Void => crate::types::VOID,
+                UiReturnKind::Str => I64,
+            };
+            ctx.pending_declares
+                .push((sig.runtime.to_string(), return_type, runtime_param_types));
+            let ref_args: Vec<(crate::types::LlvmType, &str)> =
+                llvm_args.iter().map(|(t, s)| (*t, s.as_str())).collect();
+            let blk = ctx.block();
+            return match sig.ret {
+                UiReturnKind::Void => {
+                    blk.call_void(sig.runtime, &ref_args);
+                    Ok(double_literal(0.0))
+                }
+                UiReturnKind::Widget => {
+                    let raw = blk.call(I64, sig.runtime, &ref_args);
+                    Ok(crate::expr::nanbox_pointer_inline(blk, &raw))
+                }
+                UiReturnKind::F64 => Ok(blk.call(DOUBLE, sig.runtime, &ref_args)),
+                UiReturnKind::Str => {
+                    let raw = blk.call(I64, sig.runtime, &ref_args);
+                    Ok(crate::expr::nanbox_string_inline(blk, &raw))
+                }
+                UiReturnKind::I64AsF64 => {
+                    let raw = blk.call(I64, sig.runtime, &ref_args);
+                    Ok(blk.sitofp(I64, &raw, DOUBLE))
+                }
+            };
+        }
+        // Unknown instance method — fail the compile. Previously this
+        // lowered the args for side effects and returned TAG_UNDEFINED,
+        // which silently swallowed styling calls like `label.setColor(...)`
+        // and `btn.setCornerRadius(...)` (see types/perry/ui/index.d.ts
+        // for the real method surface — styling uses the free-function
+        // `textSetColor(widget, r, g, b, a)` / `setCornerRadius(widget, r)`
+        // forms, not instance methods on the widget handle).
+        bail!(
+            "perry/ui: '.{}(...)' is not a known instance method (args: {}). \
+             See types/perry/ui/index.d.ts — widget styling uses free functions \
+             like `textSetFontSize(label, 24)` and `widgetSetBackgroundColor(btn, r, g, b, a)`, \
+             not instance-method setters.",
+            method,
+            args.len()
+        );
+    }
+
+    // perry/plugin PluginApi instance methods: `api.registerHook(...)`, `api.emit(...)`, etc.
+    // The HIR produces these with `object: Some(handle)` and `module: "perry/plugin"`.
+    if module == "perry/plugin" {
+        let recv_val = lower_expr(ctx, recv)?;
+        let blk = ctx.block();
+        let handle = unbox_to_i64(blk, &recv_val);
+        if let Some(sig) = perry_plugin_instance_method_lookup(method) {
+            let mut llvm_args: Vec<(crate::types::LlvmType, String)> =
+                Vec::with_capacity(1 + args.len());
+            let mut runtime_param_types: Vec<crate::types::LlvmType> =
+                Vec::with_capacity(1 + args.len());
+            llvm_args.push((I64, handle));
+            runtime_param_types.push(I64);
+            for (kind, arg) in sig.args.iter().zip(args.iter()) {
+                match kind {
+                    UiArgKind::Widget => {
+                        let v = lower_expr(ctx, arg)?;
+                        let blk = ctx.block();
+                        let h = unbox_to_i64(blk, &v);
+                        llvm_args.push((I64, h));
+                        runtime_param_types.push(I64);
+                    }
+                    UiArgKind::Str => {
+                        let h = get_raw_string_ptr(ctx, arg)?;
+                        llvm_args.push((I64, h));
+                        runtime_param_types.push(I64);
+                    }
+                    UiArgKind::F64 | UiArgKind::Closure => {
+                        let v = lower_expr(ctx, arg)?;
+                        llvm_args.push((DOUBLE, v));
+                        runtime_param_types.push(DOUBLE);
+                    }
+                    UiArgKind::I64Raw => {
+                        let v = lower_expr(ctx, arg)?;
+                        let blk = ctx.block();
+                        let i = blk.fptosi(DOUBLE, &v, I64);
+                        llvm_args.push((I64, i));
+                        runtime_param_types.push(I64);
+                    }
+                }
+            }
+            let return_type = match sig.ret {
+                UiReturnKind::Widget | UiReturnKind::I64AsF64 | UiReturnKind::Str => I64,
+                UiReturnKind::F64 => DOUBLE,
+                UiReturnKind::Void => crate::types::VOID,
+            };
+            ctx.pending_declares
+                .push((sig.runtime.to_string(), return_type, runtime_param_types));
+            let ref_args: Vec<(crate::types::LlvmType, &str)> =
+                llvm_args.iter().map(|(t, s)| (*t, s.as_str())).collect();
+            let blk = ctx.block();
+            return match sig.ret {
+                UiReturnKind::Void => {
+                    blk.call_void(sig.runtime, &ref_args);
+                    Ok(double_literal(0.0))
+                }
+                UiReturnKind::Widget => {
+                    let raw = blk.call(I64, sig.runtime, &ref_args);
+                    Ok(crate::expr::nanbox_pointer_inline(blk, &raw))
+                }
+                UiReturnKind::F64 => Ok(blk.call(DOUBLE, sig.runtime, &ref_args)),
+                UiReturnKind::I64AsF64 => {
+                    let raw = blk.call(I64, sig.runtime, &ref_args);
+                    Ok(blk.sitofp(I64, &raw, DOUBLE))
+                }
+                UiReturnKind::Str => {
+                    let raw = blk.call(I64, sig.runtime, &ref_args);
+                    Ok(crate::expr::nanbox_string_inline(blk, &raw))
+                }
+            };
+        }
+        bail!(
+            "perry/plugin: '.{}(...)' is not a known PluginApi method (args: {}). \
+             See types/perry/plugin/index.d.ts for the supported API surface.",
+            method,
+            args.len()
+        );
+    }
+
+    if module == "array" && (method == "push_single" || method == "push") {
+        if args.is_empty() {
+            bail!("array.push expects ≥1 arg, got 0");
+        }
+        // Lower every argument first so closures and string literals get
+        // collected, then lower the receiver once. js_array_push_f64 may
+        // realloc on each call, so we thread the returned pointer through
+        // and write the final pointer back to the receiver — but ONLY
+        // if it actually changed. The runtime returns the same pointer
+        // when capacity was sufficient (no grow); the writeback is a
+        // no-op in that case but still costs a `js_object_set_field_by_name`
+        // call (~50-100 cycles) per push. With amortized doubling, real
+        // reallocs are O(log N) of the total pushes — guarding the
+        // writeback elides the overhead on the 99.9% no-realloc path.
+        let mut lowered: Vec<String> = Vec::with_capacity(args.len());
+        for a in args {
+            lowered.push(lower_expr(ctx, a)?);
+        }
+        let arr_box = lower_expr(ctx, recv)?;
+        let blk = ctx.block();
+        let mut arr_handle = unbox_to_i64(blk, &arr_box);
+        let orig_handle = arr_handle.clone();
+        for v in &lowered {
+            let blk = ctx.block();
+            arr_handle = blk.call(I64, "js_array_push_f64", &[(I64, &arr_handle), (DOUBLE, v)]);
+        }
+        let blk = ctx.block();
+        let new_handle = arr_handle;
+        let new_box = nanbox_pointer_inline(blk, &new_handle);
+        // Compare the (possibly-realloc'd) pointer against the original
+        // and only run the writeback when it actually differs. Setup
+        // wb / merge basic blocks so the write-back path is cold.
+        // Match arms decide the writeback shape:
+        //   1. recv = LocalGet(id)  → store back to the local's slot
+        //   2. recv = PropertyGet { obj, prop } → set obj.prop = new_box
+        //   3. anything else → no writeback (array may dangle on realloc,
+        //      but we don't crash at codegen — same trade-off as before).
+        let needs_writeback = matches!(recv, Expr::LocalGet(_) | Expr::PropertyGet { .. });
+        if needs_writeback {
+            let blk = ctx.block();
+            let changed = blk.icmp_ne(I64, &new_handle, &orig_handle);
+            let wb_idx = ctx.new_block("arr.push.wb");
+            let merge_idx = ctx.new_block("arr.push.merge");
+            let wb_label = ctx.block_label(wb_idx);
+            let merge_label = ctx.block_label(merge_idx);
+            ctx.block().cond_br(&changed, &wb_label, &merge_label);
+
+            ctx.current_block = wb_idx;
+            match recv {
+                Expr::LocalGet(id) => {
+                    if let Some(slot) = ctx.locals.get(id).cloned() {
+                        ctx.block().store(DOUBLE, &new_box, &slot);
+                    } else if let Some(global_name) = ctx.module_globals.get(id).cloned() {
+                        let g_ref = format!("@{}", global_name);
+                        ctx.block().store(DOUBLE, &new_box, &g_ref);
+                    }
+                }
+                Expr::PropertyGet {
+                    object: obj_expr,
+                    property,
+                } => {
+                    let obj_box = lower_expr(ctx, obj_expr)?;
+                    let key_idx = ctx.strings.intern(property);
+                    let key_handle_global =
+                        format!("@{}", ctx.strings.entry(key_idx).handle_global);
+                    let blk = ctx.block();
+                    let obj_bits = blk.bitcast_double_to_i64(&obj_box);
+                    let obj_handle = blk.and(I64, &obj_bits, POINTER_MASK_I64);
+                    let key_box = blk.load(DOUBLE, &key_handle_global);
+                    let key_bits = blk.bitcast_double_to_i64(&key_box);
+                    let key_raw = blk.and(I64, &key_bits, POINTER_MASK_I64);
+                    blk.call_void(
+                        "js_object_set_field_by_name",
+                        &[(I64, &obj_handle), (I64, &key_raw), (DOUBLE, &new_box)],
+                    );
+                }
+                _ => unreachable!(),
+            }
+            ctx.block().br(&merge_label);
+
+            ctx.current_block = merge_idx;
+        }
+        // push returns the new length in JS spec; for now we return
+        // the new boxed pointer (statement context discards it).
+        return Ok(new_box);
+    }
+
+    if module == "array" && (method == "pop_back" || method == "pop") {
+        if !args.is_empty() {
+            bail!("array.pop expects 0 args, got {}", args.len());
+        }
+        let arr_box = lower_expr(ctx, recv)?;
+        let blk = ctx.block();
+        let arr_handle = unbox_to_i64(blk, &arr_box);
+        return Ok(blk.call(DOUBLE, "js_array_pop_f64", &[(I64, &arr_handle)]));
+    }
+
+    // Generic native module dispatch (with receiver): fastify instance
+    // methods (app.get, app.listen, conn.query, etc.), mysql2, ws, pg,
+    // ioredis, mongodb, better-sqlite3, etc.
+    if let Some(sig) = native_module_lookup(module, true, method, class_name) {
+        let recv_val = lower_expr(ctx, recv)?;
+        let blk = ctx.block();
+        let handle = unbox_to_i64(blk, &recv_val);
+        return lower_native_module_dispatch(ctx, sig, Some(&handle), args);
+    }
+
+    // Unknown native method: lower the receiver and args for side
+    // effects (so closures inside them get auto-collected and any
+    // string literals get interned), then return a sentinel. This
+    // unblocks compilation of programs that touch native modules
+    // we haven't wired up yet — they'll produce garbage at runtime
+    // but won't fail at codegen time.
+    let _ = lower_expr(ctx, recv)?;
+    for a in args {
+        let _ = lower_expr(ctx, a)?;
+    }
+    Ok(double_literal(0.0))
+}

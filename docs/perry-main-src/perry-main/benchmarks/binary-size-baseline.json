@@ -1,0 +1,10 @@
+{
+  "commit": "7fd1c8b3",
+  "generated_at": "2026-05-01T00:00:00Z",
+  "sizes": {
+    "perry": 15537232,
+    "libperry_runtime": 31717320,
+    "libperry_stdlib": 211805880
+  },
+  "_note": "Refreshed at v0.5.455 after the v0.5.386 → v0.5.455 release cycle (67 patch versions of accumulated work pushed perry binary +20%). The 15% per-release threshold is meant for incremental drift, not multi-release catch-up gates. Sizes captured from a release-mode build on macos-14-equivalent (aarch64-apple-darwin) — CI macos-14 should match within <1%."
+}

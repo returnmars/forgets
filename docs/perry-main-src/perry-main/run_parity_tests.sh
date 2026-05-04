@@ -1,0 +1,488 @@
+#!/bin/bash
+# Perry Parity Test Runner
+# Compares output between Node.js and Perry native compilation
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TEST_DIR="$SCRIPT_DIR/test-files"
+OUTPUT_DIR="$SCRIPT_DIR/test-parity/output"
+REPORT_DIR="$SCRIPT_DIR/test-parity/reports"
+
+# LLVM is the only backend post-Phase K hard cutover. The --llvm /
+# --cranelift flags and PERRY_BACKEND env var are kept as no-ops for
+# backward compat with existing scripts.
+BACKEND_FLAG=""
+BACKEND_LABEL="LLVM"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Find timeout command (GNU coreutils on Linux, gtimeout on macOS via Homebrew)
+if command -v timeout &> /dev/null; then
+    TIMEOUT_CMD="timeout"
+elif command -v gtimeout &> /dev/null; then
+    TIMEOUT_CMD="gtimeout"
+else
+    # No timeout available - run without timeout
+    TIMEOUT_CMD=""
+fi
+
+# Function to run with optional timeout
+run_with_timeout() {
+    local seconds=$1
+    shift
+    if [[ -n "$TIMEOUT_CMD" ]]; then
+        $TIMEOUT_CMD "$seconds" "$@"
+    else
+        "$@"
+    fi
+}
+
+# ── TLS-upgrade companion server (issue #275) ──────────────────────────────
+# Spawned once per test_net_upgrade_tls* test; killed immediately after.
+# Uses a self-signed cert; test calls upgradeToTLS(host, verify=0) so cert
+# validation is intentionally disabled on the client side.
+
+TLS_UPGRADE_SERVER_PID=""
+
+start_tls_upgrade_server() {
+    python3 "$SCRIPT_DIR/test-files/test_net_upgrade_tls_server.py" --port 17892 &
+    TLS_UPGRADE_SERVER_PID=$!
+    # Wait up to 3 s for the port to open.
+    local i
+    for i in $(seq 1 30); do
+        nc -z 127.0.0.1 17892 2>/dev/null && return 0
+        sleep 0.1
+    done
+    echo -e "${YELLOW}WARN${NC}  TLS-upgrade server did not come up in time (pid $TLS_UPGRADE_SERVER_PID)" >&2
+    return 1
+}
+
+stop_tls_upgrade_server() {
+    if [[ -n "$TLS_UPGRADE_SERVER_PID" ]]; then
+        kill "$TLS_UPGRADE_SERVER_PID" 2>/dev/null || true
+        wait "$TLS_UPGRADE_SERVER_PID" 2>/dev/null || true
+        TLS_UPGRADE_SERVER_PID=""
+    fi
+}
+
+# ── Perry-specific expected-output tests ────────────────────────────────────
+# Some tests use Perry APIs that don't map 1:1 to Node.js (e.g. Perry's
+# net.createConnection(host, port) vs Node.js's (port, host)).  For these,
+# instead of comparing to Node.js, we compare Perry's output against a
+# stored expected file in test-parity/expected/<test_name>.txt.
+# Node.js is still run; if it exits non-zero we record NODE_FAIL and skip;
+# if it exits 0 but with a different output we fall through to the expected-
+# file comparison (not a parity fail — the incompatibility is intentional).
+EXPECTED_DIR="$SCRIPT_DIR/test-parity/expected"
+
+has_expected_output() {
+    [[ -f "$EXPECTED_DIR/${1}.txt" ]]
+}
+
+# ── Counters ────────────────────────────────────────────────────────────────
+PARITY_PASS=0
+PARITY_FAIL=0
+COMPILE_FAIL=0
+NODE_FAIL=0
+SKIPPED=0
+
+# Arrays for tracking
+declare -a PARITY_FAILURES=()
+declare -a COMPILE_FAILURES=()
+
+# Create output directories
+mkdir -p "$OUTPUT_DIR/node" "$OUTPUT_DIR/perry" "$REPORT_DIR"
+
+# Tests to skip (async tests that hang, random-dependent tests, etc.)
+SKIP_TESTS=(
+    # Async tests (need event loop)
+    "test_async"
+    "test_async2"
+    "test_async3"
+    "test_async4"
+    "test_async5"
+    "test_async_chain"
+    "test_timer"
+    # Tests with inherently non-deterministic output
+    "test_date"      # timestamps differ
+    "test_math"      # Math.random() differs
+    "test_require"   # crypto.randomUUID() differs
+    # Tests that use TypeScript features not supported by Node.js --experimental-strip-types
+    "test_enum"             # TS enums need transformation
+    "test_decorators"       # TS decorators need transformation
+    # Tests that need specific Node.js imports
+    "test_crypto"           # crypto.randomBytes needs import
+    "test_fs"               # fs module needs import
+    "test_path"             # path module needs import
+    "test_integration_app"  # uses fs module
+    # Network tests — test_net_min and test_net_socket are handled by the
+    # plain TCP echo-server lifecycle (start_echo_server / stop_echo_server,
+    # added in #286). test_net_upgrade_tls is handled by the TLS-upgrade
+    # companion server spawned inline below (#288). test_tls_connect needs
+    # outbound HTTPS to example.com:443 — skip unconditionally.
+    "test_tls_connect"
+    # Timing benchmarks — print Date.now() deltas which differ
+    # run-to-run. Both perry and node produce correct output;
+    # the parity diff is just measurement noise.
+    "test_issue58_object_string"
+    "test_issue63_arr"
+    "test_issue63_escape"
+    # `test_issue63_asm` prints sink.length (deterministic), keep it.
+)
+
+# Function to check if test should be skipped
+should_skip() {
+    local test_name=$1
+    for skip in "${SKIP_TESTS[@]}"; do
+        if [[ "$test_name" == "$skip" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Function to normalize output for comparison
+normalize_output() {
+    local input="$1"
+
+    # First pass: decode Buffer representations
+    # <Buffer XX XX...> -> decoded string
+    local decoded=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "<Buffer"* ]]; then
+            # Extract hex part and decode
+            local hex=$(echo "$line" | sed 's/<Buffer //' | sed 's/>//')
+            # Decode hex to string (may contain embedded newlines)
+            local decoded_line=$(echo "$hex" | xxd -r -p)
+            decoded+="$decoded_line"$'\n'
+        else
+            decoded+="$line"$'\n'
+        fi
+    done <<< "$input"
+
+    echo "$decoded" | \
+        # Normalize line endings
+        tr -d '\r' | \
+        # Strip Node v22+ MODULE_TYPELESS_PACKAGE_JSON warnings (4 lines
+        # printed to stderr when running .ts files without "type":
+        # "module" in package.json — pure environmental noise that
+        # appeared after the Node v25 upgrade and has nothing to do
+        # with Perry's output).
+        sed -E '/^\(node:[0-9]+\) \[MODULE_TYPELESS_PACKAGE_JSON\]/d' | \
+        sed -E '/^Reparsing as ES module because module syntax was detected/d' | \
+        sed -E '/^To eliminate this warning, add "type": "module"/d' | \
+        sed -E '/^\(Use `node --trace-warnings/d' | \
+        # Trim trailing whitespace on each line
+        sed 's/[[:space:]]*$//' | \
+        # Normalize boolean output: true->1, false->0 (whole line only)
+        sed -E 's/^true$/1/' | \
+        sed -E 's/^false$/0/' | \
+        # Normalize floating point precision (keep 10 decimal places)
+        sed -E 's/([0-9]+\.[0-9]{10})[0-9]+/\1/g' | \
+        # Normalize console.time/timeLog/timeEnd output: the elapsed value
+        # will always differ between Node.js (JIT) and Perry (native LLVM).
+        # Covers ms, s, and μs (microseconds — emitted on fast macOS-14 ARM
+        # runners when timer duration is < 1 ms, e.g. timerA/timerB in
+        # test_gap_console_methods which have no work between start and end).
+        # The optional [[:space:]]* handles Node.js v18's "N.NNN ms" format
+        # (space before unit); v22 produces "N.NNNms" without.
+        sed -E 's/^([^:]+): [0-9]+(\.[0-9]+)?[[:space:]]*(μs|ms|s)$/\1: <timer>/g' | \
+        # Normalize console.trace output: strip stack frame lines so only
+        # the "Trace: <message>" header survives for comparison.
+        # Node.js emits "    at <symbol> (<location>)" JS stack frames;
+        # Perry emits "    N: <symbol>" native frame headers, indented
+        # "             at <file:line>" continuation lines, and
+        # "        (… N more identical frames)" dedup-collapse lines.
+        # All three shapes have leading whitespace; the distinguishing
+        # suffixes are "at ", a digit+colon, or a literal "(…".
+        sed -E '/^[[:space:]]+at /d' | \
+        sed -E '/^[[:space:]]+[0-9]+: /d' | \
+        sed -E '/^[[:space:]]+[(].*more identical frames[)]/d' | \
+        # Remove trailing empty lines
+        sed -e :a -e '/^\n*$/{$d;N;ba' -e '}'
+}
+
+echo "========================================"
+echo "   Perry Parity Test Runner ($BACKEND_LABEL)"
+echo "========================================"
+echo ""
+
+# Build the compiler + runtime + stdlib in release mode. We invoke the
+# resulting `target/release/perry` binary directly per-test below — pre-fix
+# the loop ran `cargo run --quiet --bin perry` which (a) silently triggers a
+# *debug* build of perry that's slower at compile-time and runtime than the
+# release binary the prior step had just produced, and (b) adds cargo's own
+# per-invocation overhead × ~150 tests.
+PERRY_BIN="$SCRIPT_DIR/target/release/perry"
+echo "Building compiler (release)..."
+if ! cargo build --release --quiet -p perry -p perry-runtime -p perry-stdlib 2>/dev/null; then
+    echo -e "${RED}Failed to build compiler${NC}"
+    exit 1
+fi
+if [[ ! -x "$PERRY_BIN" ]]; then
+    echo -e "${RED}Expected $PERRY_BIN after release build${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}Compiler and runtime built successfully${NC}"
+echo ""
+echo "Running parity tests (backend: $BACKEND_LABEL)..."
+echo ""
+
+# ---------------------------------------------------------------------------
+# Echo server lifecycle (port 17891) — required by test_net_min and
+# test_net_socket.  We spawn it in the background, wait up to 5 s for it to
+# accept connections, and register a cleanup trap so it always gets killed on
+# script exit regardless of how the script terminates.
+# ---------------------------------------------------------------------------
+ECHO_SERVER_PID=""
+ECHO_SERVER_SCRIPT="$SCRIPT_DIR/test-files/test_net_echo_server.py"
+
+start_echo_server() {
+    if ! command -v python3 &>/dev/null; then
+        echo "Warning: python3 not found — test_net_min / test_net_socket will fail parity"
+        return
+    fi
+    if [[ ! -f "$ECHO_SERVER_SCRIPT" ]]; then
+        echo "Warning: $ECHO_SERVER_SCRIPT not found — test_net_min / test_net_socket will fail parity"
+        return
+    fi
+    python3 "$ECHO_SERVER_SCRIPT" &
+    ECHO_SERVER_PID=$!
+    # Poll up to 5 s (50 × 100 ms) for the server to accept connections.
+    local ready=0
+    for _i in $(seq 1 50); do
+        if nc -z 127.0.0.1 17891 2>/dev/null; then
+            ready=1
+            break
+        fi
+        sleep 0.1
+    done
+    if [[ $ready -eq 1 ]]; then
+        echo "Echo server started on 127.0.0.1:17891 (PID $ECHO_SERVER_PID)"
+    else
+        echo "Warning: echo server did not become ready in 5 s — net tests may fail parity"
+    fi
+}
+
+stop_echo_server() {
+    if [[ -n "$ECHO_SERVER_PID" ]]; then
+        kill "$ECHO_SERVER_PID" 2>/dev/null
+        wait "$ECHO_SERVER_PID" 2>/dev/null
+        ECHO_SERVER_PID=""
+    fi
+}
+
+trap stop_echo_server EXIT
+
+start_echo_server
+echo ""
+
+# JSON report data
+REPORT_FILE="$REPORT_DIR/parity_report_$(date +%Y%m%d_%H%M%S).json"
+LATEST_REPORT="$REPORT_DIR/latest.json"
+
+# Start JSON array for test results
+TEST_RESULTS="[]"
+
+# Run each test
+for test_file in "$TEST_DIR"/*.ts; do
+    # Skip directories (multi/ folder)
+    [[ -d "$test_file" ]] && continue
+
+    test_name=$(basename "$test_file" .ts)
+    node_output_file="$OUTPUT_DIR/node/${test_name}.txt"
+    perry_output_file="$OUTPUT_DIR/perry/${test_name}.txt"
+    perry_binary="/tmp/perry_parity_$test_name"
+
+    # Check if test should be skipped
+    if should_skip "$test_name"; then
+        echo -e "${YELLOW}SKIP${NC}  $test_name (async/timer test)"
+        ((SKIPPED++))
+        continue
+    fi
+
+    # Spawn per-test companion servers when needed.
+    # test_net_upgrade_tls* — plain→TLS upgrade server on port 17892 (issue #275).
+    local_server_pid=""
+    if [[ "$test_name" == test_net_upgrade_tls* ]]; then
+        start_tls_upgrade_server
+        local_server_pid="$TLS_UPGRADE_SERVER_PID"
+    fi
+
+    # Run with Node.js
+    node_output=$(run_with_timeout 10 node --experimental-strip-types "$test_file" 2>&1)
+    node_exit=$?
+
+    if [[ $node_exit -ne 0 && $node_exit -ne 124 ]]; then
+        # Node.js failed — if we have a stored expected-output file for this
+        # test (e.g. because the test uses syntax that this Node version
+        # doesn't support, like `await using` on Node <22.12), fall through
+        # to compile+run Perry and compare against the expected file.
+        # Otherwise record NODE_FAIL and skip.
+        if ! has_expected_output "$test_name"; then
+            echo -e "${YELLOW}SKIP${NC}  $test_name (Node.js error: exit $node_exit)"
+            ((NODE_FAIL++))
+            [[ -n "$local_server_pid" ]] && stop_tls_upgrade_server
+            continue
+        fi
+        echo -e "${YELLOW}NOTE${NC}  $test_name (Node.js error: exit $node_exit — using expected-output)"
+    fi
+
+    # Save Node.js output
+    echo "$node_output" > "$node_output_file"
+
+    # Compile with Perry. Direct invocation of the release binary built
+    # above — pre-fix this was `cargo run --quiet --bin perry --` (no
+    # `--release`), which silently triggered a debug build of perry that
+    # was both slower as a compiler and incurred per-call cargo overhead
+    # × ~150 tests. Direct binary call shaves multiple minutes off CI.
+    compile_output=$("$PERRY_BIN" $BACKEND_FLAG "$test_file" -o "$perry_binary" 2>&1)
+    compile_exit=$?
+
+    if [[ $compile_exit -ne 0 ]]; then
+        echo -e "${RED}FAIL${NC}  $test_name (compile error)"
+        ((COMPILE_FAIL++))
+        COMPILE_FAILURES+=("$test_name")
+        echo "" > "$perry_output_file"
+        # Persist the actual compile stderr so CI artifacts can be inspected
+        # to diagnose long-tail compile failures (e.g. the macOS-14 SDK gap
+        # tracked as `ci-env` in test-parity/known_failures.json). Pre-fix
+        # the parity runner only logged "compile error" with no detail and
+        # the macOS-14 family was diagnosed by inference, not data.
+        compile_log="$OUTPUT_DIR/${test_name}.compile_error.log"
+        printf "%s\n" "$compile_output" > "$compile_log"
+        [[ -n "$local_server_pid" ]] && stop_tls_upgrade_server
+        continue
+    fi
+
+    # Run Perry binary
+    perry_output=$(run_with_timeout 10 "$perry_binary" 2>&1)
+    perry_exit=$?
+
+    # Save Perry output
+    echo "$perry_output" > "$perry_output_file"
+
+    # For tests that have a stored expected-output file (Perry-specific APIs
+    # that don't map 1:1 to Node.js), compare Perry output against the file
+    # instead of against Node.js.  This lets us verify Perry's behaviour
+    # end-to-end without requiring Node.js to speak the same API.
+    if has_expected_output "$test_name"; then
+        expected_normalized=$(normalize_output "$(cat "$EXPECTED_DIR/${test_name}.txt")")
+        perry_normalized=$(normalize_output "$perry_output")
+        if [[ "$perry_normalized" == "$expected_normalized" ]]; then
+            echo -e "${GREEN}PASS${NC}  $test_name (expected-output)"
+            ((PARITY_PASS++))
+            status="pass"
+        else
+            echo -e "${RED}FAIL${NC}  $test_name (expected-output mismatch)"
+            ((PARITY_FAIL++))
+            PARITY_FAILURES+=("$test_name")
+            status="fail"
+            echo "       Expected: $(cat "$EXPECTED_DIR/${test_name}.txt" | head -1)"
+            echo "       Perry:    $(echo "$perry_output" | head -1)"
+        fi
+    else
+        # Normalize both outputs for comparison
+        node_normalized=$(normalize_output "$node_output")
+        perry_normalized=$(normalize_output "$perry_output")
+
+        # Compare outputs
+        if [[ "$node_normalized" == "$perry_normalized" ]]; then
+            echo -e "${GREEN}PASS${NC}  $test_name"
+            ((PARITY_PASS++))
+            status="pass"
+        else
+            echo -e "${RED}FAIL${NC}  $test_name (output mismatch)"
+            ((PARITY_FAIL++))
+            PARITY_FAILURES+=("$test_name")
+            status="fail"
+
+            # Show diff for failures (first few lines)
+            echo "       Node.js:    $(echo "$node_output" | head -1)"
+            echo "       Perry:  $(echo "$perry_output" | head -1)"
+        fi
+    fi
+
+    # Stop any per-test companion server that was started for this test.
+    [[ -n "$local_server_pid" ]] && stop_tls_upgrade_server
+
+    # Clean up binary
+    rm -f "$perry_binary"
+done
+
+# Calculate parity percentage
+TOTAL_RUN=$((PARITY_PASS + PARITY_FAIL))
+if [[ $TOTAL_RUN -gt 0 ]]; then
+    PARITY_PCT=$(echo "scale=1; $PARITY_PASS * 100 / $TOTAL_RUN" | bc)
+else
+    PARITY_PCT="0.0"
+fi
+
+# Summary
+echo ""
+echo "========================================"
+echo "   Parity Test Summary"
+echo "========================================"
+echo -e "${GREEN}Parity Pass:${NC}   $PARITY_PASS"
+echo -e "${RED}Parity Fail:${NC}   $PARITY_FAIL"
+echo -e "${RED}Compile Fail:${NC}  $COMPILE_FAIL"
+echo -e "${YELLOW}Skipped:${NC}       $SKIPPED"
+echo ""
+echo -e "${CYAN}Parity Rate:${NC}   ${PARITY_PCT}%"
+echo ""
+
+# List failures
+if [[ ${#PARITY_FAILURES[@]} -gt 0 ]]; then
+    echo "Output Mismatches:"
+    for failed in "${PARITY_FAILURES[@]}"; do
+        echo "  - $failed"
+    done
+    echo ""
+fi
+
+if [[ ${#COMPILE_FAILURES[@]} -gt 0 ]]; then
+    echo "Compile Failures:"
+    for failed in "${COMPILE_FAILURES[@]}"; do
+        echo "  - $failed"
+    done
+    echo ""
+fi
+
+# Generate JSON report
+cat > "$REPORT_FILE" << EOF
+{
+  "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "summary": {
+    "parity_pass": $PARITY_PASS,
+    "parity_fail": $PARITY_FAIL,
+    "compile_fail": $COMPILE_FAIL,
+    "node_fail": $NODE_FAIL,
+    "skipped": $SKIPPED,
+    "total_run": $TOTAL_RUN,
+    "parity_percentage": $PARITY_PCT
+  },
+  "failures": {
+    "parity": [$(printf '"%s",' "${PARITY_FAILURES[@]}" | sed 's/,$//')]
+,
+    "compile": [$(printf '"%s",' "${COMPILE_FAILURES[@]}" | sed 's/,$//')]
+
+  }
+}
+EOF
+
+# Create latest symlink
+cp "$REPORT_FILE" "$LATEST_REPORT"
+
+echo "Report saved to: $REPORT_FILE"
+echo ""
+
+# Exit with error if parity is below threshold (80%)
+if (( $(echo "$PARITY_PCT < 80" | bc -l) )); then
+    echo -e "${RED}Parity below 80% threshold${NC}"
+    exit 1
+fi

@@ -1,0 +1,27 @@
+[package]
+name = "perry-ui-gtk4"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+perry-ui = { path = "../perry-ui" }
+perry-ui-testkit = { workspace = true }
+perry-runtime = { path = "../perry-runtime" }
+libc = "0.2"
+gtk4 = { version = "0.9", features = ["v4_6"] }
+cairo-rs = "0.20"
+# perry/media — GStreamer playbin for streaming audio playback (#351).
+gstreamer = "0.23"
+# perry/media — MPRIS D-Bus exposure for GNOME / KDE / playerctl /
+# Bluetooth headphones (#366). Linux-only; zbus has Linux-specific
+# system deps that don't build on macOS / Windows hosts, so the crate
+# stays gated behind cfg(target_os = "linux") in the source.
+[target.'cfg(target_os = "linux")'.dependencies]
+mpris-server = { version = "0.10", features = ["tokio"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "net", "io-util"] }
+
+[features]
+geisterhand = []
