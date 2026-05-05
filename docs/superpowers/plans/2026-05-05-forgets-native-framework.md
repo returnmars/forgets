@@ -86,6 +86,7 @@ packages/cli/src/commands/openapi.ts
 packages/cli/src/commands/build.ts
 
 examples/hello-world/src/main.ts
+examples/hello-world/src/server.ts
 examples/hello-world/src/app.ts
 examples/hello-world/src/health.routes.ts
 examples/hello-world/forgets.config.ts
@@ -1145,10 +1146,9 @@ import { generatePerryEntry } from "../src/index";
 describe("generatePerryEntry", () => {
   it("generates a single Perry entry file", () => {
     expect(generatePerryEntry({
-      appImport: "../src/main",
-      appExport: "app",
-      portExpression: "3000",
-    })).toContain("await app.listen(3000);");
+      serverImport: "../src/server",
+      serverExport: "buildServer",
+    })).toContain("await app.listen(config.PORT);");
   });
 });
 ```
@@ -1163,16 +1163,16 @@ Expected: FAIL because `generatePerryEntry` does not exist.
 
 ```ts
 export interface PerryEntryOptions {
-  appImport: string;
-  appExport: string;
-  portExpression: string;
+  serverImport: string;
+  serverExport: string;
 }
 
 export function generatePerryEntry(options: PerryEntryOptions): string {
   return [
-    `import { ${options.appExport} as app } from "${options.appImport}";`,
+    `import { ${options.serverExport} } from "${options.serverImport}";`,
     "",
-    `await app.listen(${options.portExpression});`,
+    `const { app, config } = await ${options.serverExport}();`,
+    "await app.listen(config.PORT);",
     "",
   ].join("\n");
 }
@@ -1504,6 +1504,7 @@ git commit -m "feat(compiler): publish artifact JSON schema contracts"
 
 - [ ] `docs/plaints-server-design.md` still states the complete production-framework target.
 - [ ] `docs/perry-compat.md` records Perry version `0.5.494`.
+- [ ] Generated Perry entry imports `buildServer()` and no user module performs top-level listen as a build contract.
 - [ ] No public API depends on decorators, `reflect-metadata`, or runtime type reflection.
 - [ ] Route factories remain statically inspectable without executing user code.
 - [ ] `@forgets/runtime` hides Perry native fastify details.
