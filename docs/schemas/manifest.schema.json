@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://forgets.dev/schemas/manifest.schema.json",
+  "title": "forgets manifest",
+  "type": "object",
+  "required": ["schemaVersion", "framework", "entry", "routes", "diagnostics"],
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "framework": {
+      "type": "string",
+      "const": "forgets"
+    },
+    "entry": {
+      "type": "string"
+    },
+    "routes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/route"
+      }
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "diagnostics.schema.json#/$defs/diagnostic"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "route": {
+      "type": "object",
+      "required": ["method", "path", "source", "tags"],
+      "properties": {
+        "method": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "factory": {
+          "type": "string"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

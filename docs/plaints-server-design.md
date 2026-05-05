@@ -1,6 +1,6 @@
-﻿# forgets Server 设计方案
+# forgets Server 设计方案
 
-> `forgets` 是一个面向 PerryTS/native TypeScript 的生产级后端服务框架。它废弃 Router Decorator，拒绝 DI/Module/Provider/reflect-metadata 等运行时魔法，采用显式路由、显式依赖、Schema-first 和 Perry-compatible 构建链路。
+> `forgets` 是一个面向 PerryTS/native TypeScript 的生产级后端服务框架。它不复刻 NestJS，不依赖 decorator、DI 容器、Module、Provider、`reflect-metadata` 或运行时类型反射。它采用显式路由、显式依赖、schema-first、静态检查和 Perry single-entry native build。
 
 核心哲学：
 
@@ -12,21 +12,33 @@
 
 ---
 
-## 0. 项目一句话
+## 0. 结论
 
-**forgets 是一个 native-first TypeScript 后端服务框架，目标是在 PerryTS 上构建高性能、稳定、可生产部署的单体二进制服务。**
+`forgets` 要做的是：
 
-它不再追求 NestJS 风格的 Router Decorator。Perry 当前主线会拒绝 TypeScript decorators，且没有 `Reflect` / `reflect-metadata` / runtime type metadata，因此装饰器路线正式废弃。
+```txt
+Go-like explicit backend framework for native TypeScript production services.
+```
 
-目标是：
+设计判断：
 
-> **Go-like explicit backend framework for native TypeScript production services.**
+```txt
+Perry 当前能力边界不适合 Router Decorator / NestJS-style DI。
+Perry single-entry native compile 很适合显式 composition root。
+Perry native fastify 可以作为第一版 HTTP driver，但不能泄漏 Fastify 插件语义。
+OpenAPI 和 route inspect 必须来自静态 RouteDefinition，不来自运行时反射。
+schema 必须是显式 runtime value，不是 TypeScript erased type。
+```
+
+因此最终目标不是“Native NestJS”，而是一个完整的生产端 native TypeScript 后端框架：开发者用 TypeScript 编写和使用框架，Perry 负责最终 native 编译和单体二进制部署。
+
+第一版不是最终边界。第一版要先做出 Perry 可验证的生产内核，然后围绕这个内核逐步补齐完整后端框架能力。
 
 ---
 
-## 1. 设计优先级
+## 1. 产品目标
 
-优先级只有三个，按顺序排列：
+`forgets` 的第一性目标按优先级排列：
 
 ```txt
 性能
@@ -37,86 +49,413 @@
 这意味着：
 
 ```txt
-优先选择 Perry 已支持、可静态分析、可 AOT 编译的能力
-优先保持路由、依赖、生命周期、错误边界可见
+优先使用 Perry 已支持、可静态分析、可 AOT 编译的能力
+优先让路由、依赖、生命周期、错误边界和构建入口可见
 优先产出能长期运行、可观测、可部署、可回滚的服务
 ```
 
-不为了表面 DX 牺牲 native 编译确定性。
+开发体验可以好，但不能靠 Perry 不稳定或不可编译的运行时魔法换来。
 
----
-
-## 2. Perry 源码调研后的硬约束
-
-基于 Perry 当前源码和文档，forgets 必须承认这些事实：
+另外有两个不可降级的产品要求：
 
 ```txt
-TypeScript decorators 不支持，class/method/property/parameter decorators 会被 lowering 阶段拒绝
-Reflect API 不支持
-reflect-metadata 不存在
-类型在编译期擦除，没有运行时 design:type/design:paramtypes
-动态 import() 不可作为生产能力
-Perry compile 入口是单个 .ts 文件，不是项目目录
-perry check 是兼容性检查，不等价于完整业务语义检查
-Fastify/fetch/ws/pg/mysql2/better-sqlite3 等有 Perry 原生 stdlib 路径
-process.env、fs、JSON、Promise、async/await、timer、TextEncoder/TextDecoder、Uint8Array 等基础能力可作为 M0 验证项
-进程信号与 AbortSignal 不是一回事，graceful shutdown 要单独验证
-```
-
-所以框架必须从一开始就走：
-
-```txt
-显式路由值 API
-静态路由表
-构建期检查
-Perry-compatible runtime subset
-native binary deployment
+对人友好：显式但不折磨，清晰但不啰嗦，错误能指导修复。
+对 AI 友好：结构稳定、信息可机器读取、静态事实可检查、诊断可引用。
 ```
 
 ---
 
-## 3. 明确不做什么
+## 2. 完整生产框架范围
 
-这些不是后续版本再考虑，而是项目边界：
+`forgets` 的完整形态不是单纯 HTTP router，而是一套 Perry-native production backend framework。
+
+完整框架应覆盖：
+
+```txt
+HTTP application model
+routing
+middleware
+schema validation
+config/env
+structured logging
+error handling
+request id
+access log
+timeout response
+body limit
+health/readiness
+OpenAPI generation
+route inspect
+native build
+native dev loop
+native smoke test
+testing helpers
+human-readable diagnostics
+machine-readable diagnostics
+AI context export
+database integration
+migration
+auth helpers
+CORS/cookie/JWT
+rate limit
+metrics/tracing
+static file
+multipart
+WebSocket/SSE
+background worker
+cron/job
+deployment templates
+```
+
+但这些能力必须分层落地：
+
+```txt
+Core Kernel     必须 Perry native compile/run 验证，所有上层能力依赖它
+Production Base 第一版生产服务必须有，默认可用
+Production Plus 常见生产功能，验证后加入
+Extensions      数据库、auth、jobs、ws 等独立包，单独验证和发布
+```
+
+能力矩阵必须维护在设计文档和 release checklist 中：
+
+| 能力 | 包 | 阶段 | Perry native 验收 | v1 承诺 |
+| --- | --- | --- | --- | --- |
+| HTTP router | `@forgets/http` + `@forgets/runtime` | Core Kernel | native fastify route smoke | 是 |
+| response normalization | `@forgets/http` | Core Kernel | undefined/null/string/json/error native smoke | 是 |
+| schema validation | `@forgets/schema` | Core Kernel | Perry compile + host unit tests | 是 |
+| static route inspect | `@forgets/compiler` | Core Kernel | AST scanner golden tests | 是 |
+| OpenAPI emit | `@forgets/compiler` | Core Kernel | golden JSON schema tests | 是 |
+| config/env | `@forgets/config` | Production Base | process.env native smoke | 是 |
+| request id/access log/recovery/timeout/body limit | `@forgets/middleware` | Production Base | native HTTP behavior tests | 是 |
+| diagnostics/manifest/AI context | `@forgets/compiler` + `@forgets/cli` | Production Base | JSON schema + golden tests | 是 |
+| graceful shutdown | `@forgets/runtime` | Production Plus | signal + close native test | 否，先验证 |
+| true request cancellation | `@forgets/runtime` | Production Plus | Abort/cancellation native test | 否，先验证 |
+| CORS/cookie/JWT/rate limit | `@forgets/middleware` | Production Plus | native HTTP behavior tests | 分项承诺 |
+| metrics/tracing | `@forgets/observability` | Production Plus | native runtime + exporter tests | 分项承诺 |
+| SQLite/PostgreSQL/MySQL | `@forgets/db-*` | Extensions | driver native compile/run tests | 分项承诺 |
+| WebSocket/SSE | `@forgets/realtime` | Extensions | native connection smoke tests | 分项承诺 |
+| workers/cron/jobs | `@forgets/jobs` | Extensions | native lifecycle tests | 分项承诺 |
+| deployment templates | `@forgets/deploy` | Extensions | generated artifact smoke tests | 分项承诺 |
+
+这意味着 MVP 不是降低目标，而是建立完整框架的可编译地基。
+
+---
+
+## 3. 人体工程学与 AI 友好
+
+`forgets` 既要 native-first，也要 humane-first。显式 API 不能变成手写样板地狱；静态约束也不能变成用户和 AI 都看不懂的隐形规则。
+
+### 3.1 对人友好
+
+人体工程学目标：
+
+```txt
+一个常见任务只有一条推荐路径
+简单服务可以很短，复杂服务仍然有清晰结构
+显式组合，但用模板和 helper 消除重复劳动
+API 命名接近日常后端语义
+错误信息带 code、位置、原因、修复建议
+CLI 默认输出适合人读
+IDE 类型提示能解释 schema、ctx、route options
+escape hatch 可以用，但会清楚提示代价
+```
+
+对人友好的 API 约束：
+
+```txt
+createApp/group/route/schema/loadConfig/createLogger 这些名字稳定且直观
+route options 的字段少而固定：params/query/body/response/tags/summary/description/middleware
+Context 只暴露高频能力，不把底层 Perry/Fastify 细节倾倒给用户
+常见中间件有默认实现：requestId/recovery/timeout/accessLog/bodyLimit
+生成器提供推荐目录，不强迫用户理解所有内部包
+```
+
+错误信息格式：
+
+```txt
+FORGETS_ROUTE_DYNAMIC_PATH
+severity: warning
+file: src/users/users.routes.ts
+message: Dynamic route path cannot be included in OpenAPI.
+suggestion: Use a string literal path such as route.get("/:id", handler).
+```
+
+CLI 必须同时支持：
+
+```txt
+默认人类输出：短、清楚、带建议
+--json 机器输出：稳定 schema、可被 AI 和工具消费
+```
+
+### 3.2 对 AI 友好
+
+AI 友好不是“给 AI 写提示词”，而是让代码库和工具链产生稳定、明确、可读取的事实。
+
+AI 友好目标：
+
+```txt
+项目结构稳定
+文件命名可预测
+路由、schema、config、构建入口可静态发现
+诊断有稳定 code
+CLI 支持 JSON 输出
+生成产物带 schemaVersion
+OpenAPI、routes、manifest、diagnostics 都能机器读取
+文档描述可执行规则，而不是只讲理念
+```
+
+AI/工具产物必须有正式 schema，并且 schemaVersion 只做向后兼容扩展：
+
+```txt
+docs/schemas/manifest.schema.json
+docs/schemas/diagnostics.schema.json
+docs/schemas/ai-context.schema.json
+```
+
+版本规则：
+
+```txt
+schemaVersion 增加字段时保持兼容，不递增 major
+删除字段、改字段含义、改类型时必须递增 major
+CLI --json 输出必须能被对应 schema 校验
+golden tests 必须覆盖 manifest/diagnostics/ai-context
+```
+
+生成产物：
+
+```txt
+.forgets/routes.generated.ts
+.forgets/openapi.generated.json
+.forgets/manifest.generated.json
+.forgets/diagnostics.generated.json
+.forgets/perry-entry.generated.ts
+```
+
+`manifest.generated.json` 应包含：
+
+```json
+{
+  "schemaVersion": 1,
+  "framework": "forgets",
+  "entry": ".forgets/perry-entry.generated.ts",
+  "routes": [
+    {
+      "method": "GET",
+      "path": "/users/:id",
+      "source": "src/users/users.routes.ts",
+      "factory": "usersRoutes",
+      "tags": ["Users"]
+    }
+  ],
+  "diagnostics": []
+}
+```
+
+面向 AI/工具的命令：
+
+```txt
+forgets routes --json
+forgets openapi --json
+forgets check --json
+forgets doctor --json
+forgets ai-context --json
+```
+
+`forgets ai-context --json` 输出框架事实，不输出敏感环境变量：
+
+```txt
+Perry version
+forgets version
+package list
+generated entry
+route graph
+schema names
+config schema keys without values
+diagnostics
+native compatibility status
+```
+
+### 3.3 取舍规则
+
+当人体工程学、AI 友好和 native 确定性发生冲突时，按这个顺序处理：
+
+```txt
+不能破坏 Perry native compile/run
+不能隐藏生产生命周期和错误边界
+优先用 scaffold/helper 改善人类体验，而不是引入反射魔法
+优先用 manifest/json diagnostics 改善 AI 体验，而不是让 AI 执行用户代码猜事实
+escape hatch 必须可运行，但必须从静态产物中明确标记或排除
+```
+
+---
+
+## 4. Perry 源码基线
+
+当前审阅基准：
+
+```txt
+Perry source: docs/perry-main-src/perry-main
+Workspace version: 0.5.494
+Compatibility baseline: docs/perry-compat.md
+```
+
+Perry 文档和源码可能存在时间差。`forgets` 的能力边界以 Perry 源码审阅加 M0 native compile/run 实测为准。
+
+### 4.1 Decorators
+
+Perry HIR lowering 会拒绝 TypeScript decorators：
+
+```txt
+class decorators
+method decorators
+property decorators
+private method/property decorators
+constructor parameter decorators
+method parameter decorators
+```
+
+源码位置：
+
+```txt
+docs/perry-main-src/perry-main/crates/perry-hir/src/lower_decl.rs
+```
+
+框架结论：
+
+```txt
+不做 @Controller
+不做 @Get/@Post/@Put/@Patch/@Delete
+不做 @Injectable/@Inject/@Module
+不做 Router Decorator
+```
+
+### 4.2 Reflect / Metadata
+
+Perry 源码里存在部分 `Reflect.*`、`Proxy`、`Symbol`、`Object.defineProperty` 的 lowering/codegen/runtime 分支。
+
+但这不等于支持：
+
+```txt
+reflect-metadata
+design:type
+design:paramtypes
+decorator metadata
+runtime TypeScript type reflection
+```
+
+框架结论：
+
+```txt
+可以承认部分 Reflect/Proxy/Symbol 存在。
+不能把路由、schema、DI、参数注入、OpenAPI 建立在 Reflect/metadata 上。
+```
+
+### 4.3 Dynamic Import
+
+动态 `import()` 仍不是可依赖的生产能力。
+
+框架结论：
+
+```txt
+不依赖 dynamic import() 做路由发现
+不在运行时遍历文件系统发现 controller
+不做自动模块加载
+```
+
+### 4.4 Compile / Check
+
+Perry `compile` 面向单个 `.ts` 入口。`perry check` 可做兼容性前置检查，但不能替代最终 codegen/link/native smoke test。
+
+框架结论：
+
+```txt
+forgets build 生成 .forgets/perry-entry.generated.ts
+perry check 只是 preflight
+发布标准必须包含 perry compile 成功
+生产声明必须有 native smoke test
+```
+
+### 4.5 Native Fastify
+
+Perry 有 native fastify stdlib 路径，能覆盖基本 HTTP server、route registration、params/query/header/body、reply status/send。
+
+源码审阅风险：
+
+```txt
+bodyLimit 是否在 server 读取 body 时强制执行需要实测
+setErrorHandler/onError 是否贯穿 request dispatch 需要实测
+undefined/null response 默认语义和 forgets 204 语义不同
+request id 应由 forgets 自己生成
+server.close/graceful close 需要实测
+```
+
+框架结论：
+
+```txt
+第一版可以封装 Perry native fastify。
+公开契约必须是 @forgets/http，不承诺 Fastify 插件兼容。
+recovery/body limit/request id/timeout/response normalization 在 forgets 层实现。
+```
+
+### 4.6 Abort / Signals
+
+`AbortController` / `AbortSignal` 有部分实现，但 `AbortSignal.timeout(ms)` 的真实计时和取消语义必须实测。
+
+`process.on("exit"/"SIGTERM"/"SIGINT")` 不能直接按 Node.js graceful shutdown 语义假定。
+
+框架结论：
+
+```txt
+timeout v1 只承诺返回 timeout response。
+timeout v1 不承诺取消底层 in-flight IO。
+graceful shutdown 第一版是验证项，不是默认承诺。
+```
+
+---
+
+## 5. 非目标
+
+这些不是“以后再做”，而是项目边界：
 
 ```txt
 不做 Router Decorator
-不做 @Controller
-不做 @Get/@Post/@Put/@Patch/@Delete
-不做 @Injectable
-不做 @Inject
-不做 @Module
+不做 @Controller/@Get/@Post/@Put/@Patch/@Delete
+不做 @Injectable/@Inject/@Module
+不做 DI container
 不做 Provider Token
-不做 imports/exports 模块系统
+不做 imports/exports Module 系统
+不做 constructor parameter injection
 不做 reflect-metadata
-不做运行时参数注入
-不做基于 constructor parameter reflection 的 DI
+不做 runtime type reflection
 不做 class-validator/class-transformer 强绑定
-不承诺兼容 NestJS 插件
-不承诺兼容全部 npm 生态
+不承诺 NestJS 插件兼容
+不承诺 Fastify 插件兼容
+不承诺全部 npm 生态兼容
 不依赖 dynamic import() 做路由发现
+不把 Node/Bun simulator 当生产语义来源
 ```
 
-原因很简单：这些能力要么 Perry 当前不支持，要么会把服务框架重新带回运行时黑箱。
+原因：
+
+```txt
+它们要么 Perry 当前不支持
+要么语义不足以作为框架契约
+要么会把生产服务重新带回运行时黑箱
+```
 
 ---
 
-## 4. 最终开发体验
+## 6. 目标开发体验
 
-目标写法应该是这样：
+推荐写法：
 
 ```ts
-import {
-  createApp,
-  group,
-  route,
-  HttpError,
-  type Context,
-} from "@forgets/http";
-
+import { createApp, group, route, HttpError, type Context } from "@forgets/http";
 import { schema } from "@forgets/schema";
+import type { Infer } from "@forgets/schema";
 import { loadConfig } from "@forgets/config";
-import { accessLog, createLogger } from "@forgets/logger";
+import { createLogger } from "@forgets/logger";
+import { accessLog, requestId, recovery, timeout } from "@forgets/middleware";
 
 const Config = schema.object({
   PORT: schema.number().default(3000),
@@ -129,7 +468,13 @@ const CreateUser = schema.object({
   email: schema.string().email(),
 });
 
-type CreateUser = schema.Infer<typeof CreateUser>;
+const User = schema.object({
+  id: schema.string(),
+  name: schema.string(),
+  email: schema.string(),
+});
+
+type CreateUser = Infer<typeof CreateUser>;
 
 class UsersRepository {
   constructor(private db: Database) {}
@@ -179,27 +524,29 @@ class UsersController {
   }
 }
 
+export function usersRoutes(controller: UsersController) {
+  return group("/users", [
+    route.get("/:id", ctx => controller.get(ctx), {
+      response: User,
+      summary: "Get user by id",
+      tags: ["Users"],
+    }),
+    route.post("/", ctx => controller.create(ctx), {
+      body: CreateUser,
+      response: User,
+      summary: "Create user",
+      tags: ["Users"],
+    }),
+  ]);
+}
+
 const config = loadConfig(Config);
 const logger = createLogger({ level: config.LOG_LEVEL });
 
 const db = new Database(config.DATABASE_URL);
-const usersRepo = new UsersRepository(db);
-const usersService = new UsersService(usersRepo);
-const usersController = new UsersController(usersService);
-
-const usersRoutes = group("/users", [
-  route.get("/:id", ctx => usersController.get(ctx), {
-    response: schema.unknown(),
-    summary: "Get user by id",
-    tags: ["Users"],
-  }),
-  route.post("/", ctx => usersController.create(ctx), {
-    body: CreateUser,
-    response: schema.unknown(),
-    summary: "Create user",
-    tags: ["Users"],
-  }),
-]);
+const repo = new UsersRepository(db);
+const service = new UsersService(repo);
+const controller = new UsersController(service);
 
 const app = createApp();
 
@@ -208,7 +555,7 @@ app.use(recovery());
 app.use(timeout(30_000));
 app.use(accessLog(logger));
 
-app.routes(usersRoutes);
+app.routes(usersRoutes(controller));
 
 await app.listen(config.PORT);
 ```
@@ -219,52 +566,40 @@ await app.listen(config.PORT);
 依赖怎么创建：看得见
 路由怎么注册：看得见
 handler 绑定到哪个实例：看得见
-请求数据从哪里来：看得见
 schema 在哪里生效：看得见
 OpenAPI 信息来自哪里：看得见
+native compile 入口可以生成：看得见
 ```
-
-没有 decorator。
-
-没有 DI 容器。
-
-没有 Module。
-
-没有 Provider。
-
-没有黑箱。
 
 ---
 
-## 5. 核心设计原则
+## 7. 核心原则
 
-### 原则一：路由必须是显式值
+### 7.1 路由必须是显式值
 
-第一版主路径只允许这种：
+主路径：
 
 ```ts
 const routes = group("/users", [
-  route.get("/:id", ctx => usersController.get(ctx)),
-  route.post("/", ctx => usersController.create(ctx)),
+  route.get("/:id", ctx => controller.get(ctx)),
+  route.post("/", ctx => controller.create(ctx)),
 ]);
 
 app.routes(routes);
 ```
 
-路由定义本身是普通 TypeScript value，而不是 decorator metadata。
-
-这样做的好处：
+收益：
 
 ```txt
 Perry 可以编译
 工具链可以静态扫描
 route inspect 不依赖运行时
-OpenAPI 生成不依赖反射
+OpenAPI 不依赖反射
 重复路由检查可以在 build 前失败
 handler 绑定明确
 ```
 
-### 原则二：依赖全部手动组合
+### 7.2 依赖全部手动组合
 
 用户自己写 composition root：
 
@@ -275,29 +610,26 @@ const service = new UsersService(repo);
 const controller = new UsersController(service);
 ```
 
-这几行不是样板代码，而是生产服务里最重要的启动逻辑。
-
 收益：
 
 ```txt
 启动顺序明确
 生命周期明确
 测试容易
-mock 容易
 没有容器查找开销
 没有 token 解析
-没有循环依赖黑洞
+没有循环依赖黑箱
 ```
 
-### 原则三：Context 优先，不做参数注入
+### 7.3 Handler 统一接受 Context
 
-不做：
+不做参数注入：
 
 ```ts
 function get(id: string, body: CreateUser) {}
 ```
 
-主路径只做：
+只做：
 
 ```ts
 async function get(ctx: Context) {
@@ -306,7 +638,7 @@ async function get(ctx: Context) {
 }
 ```
 
-原因：
+收益：
 
 ```txt
 参数来源清楚
@@ -316,9 +648,9 @@ AOT 友好
 和 Go handler 思想一致
 ```
 
-### 原则四：Schema 是运行时边界
+### 7.4 Schema 是 runtime 边界
 
-TypeScript 类型会被擦除。所有外部输入输出都必须用 schema 描述：
+TypeScript 类型会擦除。所有外部输入输出必须用 schema 显式描述：
 
 ```ts
 const CreateUser = schema.object({
@@ -326,25 +658,23 @@ const CreateUser = schema.object({
   email: schema.string().email(),
 });
 
-type CreateUser = schema.Infer<typeof CreateUser>;
+type CreateUser = Infer<typeof CreateUser>;
 ```
 
 schema 负责：
 
 ```txt
 config/env 校验
-request params 校验
-query 校验
-JSON body 校验
+params/query/body 校验
 response 描述
-OpenAPI 生成
+OpenAPI schema emit
 错误格式
-测试 mock
+测试样例生成
 ```
 
-### 原则五：生产行为优先于开发期方便
+### 7.5 生产行为优先
 
-forgets 不能出现这种情况：
+不能出现：
 
 ```txt
 dev 模式能跑
@@ -352,51 +682,292 @@ native build 失败
 生产行为和开发行为不一致
 ```
 
-因此：
+要求：
 
 ```txt
-forgets check 必须早发现 Perry 不兼容能力
-forgets dev 默认应尽量贴近 Perry runtime
-Node/Bun simulator 只能作为辅助，不作为生产语义来源
-所有稳定 API 都要能被 Perry compile 验证
+forgets check 早发现 Perry 不兼容能力
+forgets dev 贴近 Perry runtime
+Node/Bun simulator 只能辅助
+稳定 API 必须能被 Perry compile 验证
 ```
 
 ---
 
-## 6. 路由 API 设计
+## 8. 包与边界
 
-### 基础 API
+建议 monorepo：
 
-```ts
-app.route("GET", "/users/:id", ctx => usersController.get(ctx));
-app.get("/healthz", () => ({ ok: true }));
+```txt
+packages/
+  http/
+  schema/
+  config/
+  logger/
+  middleware/
+  observability/
+  cli/
+  compiler/
+  runtime/
+  testing/
+examples/
+  hello-world/
+  rest-api/
+  sqlite-api/
+  postgres-api/
+docs/
+  perry-compat.md
+  plaints-server-design.md
+  schemas/
+    manifest.schema.json
+    diagnostics.schema.json
+    ai-context.schema.json
 ```
 
-### 推荐 API
+### 8.1 `@forgets/http`
 
-```ts
-const healthRoutes = group("", [
-  route.get("/healthz", healthController.health),
-  route.get("/readyz", healthController.ready),
-]);
+职责：
 
-const userRoutes = group("/users", [
-  route.get("/:id", ctx => usersController.get(ctx)),
-  route.post("/", ctx => usersController.create(ctx)),
-]);
-
-app.routes([healthRoutes, userRoutes]);
+```txt
+createApp()
+group()
+route.get/post/put/patch/delete/head/options
+Context
+ResponseBuilder
+HttpError
+Middleware
+response normalization
+driver adapter interface
 ```
 
-### RouteDefinition
+不负责：
+
+```txt
+OpenAPI 文件写入
+Perry CLI 调用
+数据库封装
+```
+
+### 8.2 `@forgets/schema`
+
+职责：
+
+```txt
+schema runtime values
+parse/safeParse
+default/coerce
+error formatting
+Infer<T>
+OpenAPI schema emit
+```
+
+推荐导入方式：
 
 ```ts
+import { schema, type Infer } from "@forgets/schema";
+
+const CreateUser = schema.object({
+  name: schema.string().min(1),
+});
+
+type CreateUser = Infer<typeof CreateUser>;
+```
+
+不推荐把类型工具挂在 `schema.Infer` 上，避免依赖 namespace/value 合并语义，减少 Perry/tsc 兼容风险。
+
+MVP 类型：
+
+```txt
+string
+number
+boolean
+object
+array
+enum
+literal
+optional
+nullable
+default
+min/max
+regex
+email
+uuid
+unknown
+```
+
+设计约束：
+
+```txt
+不依赖 Reflect metadata
+不依赖 decorator
+不依赖 Proxy 作为核心机制
+不直接绑定 Zod
+```
+
+### 8.3 `@forgets/config`
+
+职责：
+
+```txt
+读取 process.env
+可选读取 .env
+按 schema 做类型转换和默认值
+启动时失败并打印结构化错误
+```
+
+API：
+
+```ts
+const Config = schema.object({
+  PORT: schema.number().default(3000),
+  DATABASE_URL: schema.string(),
+});
+
+const config = loadConfig(Config);
+```
+
+### 8.4 `@forgets/logger`
+
+职责：
+
+```txt
+structured logger
+error log
+```
+
+输出 JSON：
+
+```json
+{
+  "level": "info",
+  "time": "2026-05-05T12:00:00.000Z",
+  "msg": "request completed",
+  "requestId": "req_1",
+  "method": "GET",
+  "path": "/healthz",
+  "status": 200,
+  "durationMs": 3
+}
+```
+
+### 8.5 `@forgets/middleware`
+
+职责：
+
+```txt
+requestId()
+recovery()
+timeout()
+bodyLimit()
+accessLog()
+CORS/cookie/JWT/rate limit 等后续生产中间件
+```
+
+边界：
+
+```txt
+中间件可依赖 @forgets/http 的 Context/Handler/Middleware
+中间件不直接依赖 Perry native fastify hook
+中间件输出的错误和日志必须走统一 diagnostics/logger 结构
+```
+
+### 8.6 `@forgets/observability`
+
+职责：
+
+```txt
+metrics
+tracing
+exporter adapters
+runtime health signals
+```
+
+这些能力属于 Production Plus，需要单独 native runtime 验证后再承诺。
+
+### 8.7 `@forgets/runtime`
+
+职责：
+
+```txt
+封装 Perry native fastify driver
+提供 driver interface
+隔离 Fastify/Perry 语义差异
+后续可替换为自有 Rust/Perry HTTP core
+```
+
+公开原则：
+
+```txt
+用户不直接感知 Fastify
+用户不依赖 Fastify plugin
+用户 API 保持 @forgets/http 契约
+```
+
+### 8.8 `@forgets/cli` / `@forgets/compiler`
+
+CLI：
+
+```txt
+forgets dev
+forgets check
+forgets routes
+forgets openapi
+forgets doctor
+forgets ai-context
+forgets build
+```
+
+命令约束：
+
+```txt
+默认输出给人读：短、明确、带修复建议
+--json 输出给工具和 AI 读：稳定 schema、稳定 diagnostic code
+```
+
+compiler 负责：
+
+```txt
+解析 forgets.config.ts
+扫描静态 route definitions
+生成 .forgets/routes.generated.ts
+生成 .forgets/openapi.generated.json
+生成 .forgets/manifest.generated.json
+生成 .forgets/diagnostics.generated.json
+生成 .forgets/perry-entry.generated.ts
+调用 perry check
+调用 perry compile
+```
+
+---
+
+## 9. HTTP API 契约
+
+### 9.1 RouteDefinition
+
+```ts
+export type HttpMethod =
+  | "GET"
+  | "POST"
+  | "PUT"
+  | "PATCH"
+  | "DELETE"
+  | "HEAD"
+  | "OPTIONS";
+
 export interface RouteDefinition {
+  kind: "route";
   method: HttpMethod;
   path: string;
   handler: Handler;
-  options?: RouteOptions;
+  options: RouteOptions;
 }
+
+export interface RouteGroup {
+  kind: "group";
+  prefix: string;
+  routes: RouteEntry[];
+}
+
+export type RouteEntry = RouteDefinition | RouteGroup;
 
 export interface RouteOptions {
   params?: Schema<any>;
@@ -410,34 +981,117 @@ export interface RouteOptions {
 }
 ```
 
-### 静态路由约束
-
-为了支持 `forgets routes` 和 `forgets openapi`，推荐路由必须满足：
-
-```txt
-route path 是字符串字面量
-HTTP method 是静态值
-RouteOptions 中的 schema 是可引用的顶层常量
-路由数组是顶层 const/export const
-不依赖 dynamic import()
-不依赖运行时遍历文件系统发现路由
-```
-
-动态注册可以存在，但属于 escape hatch：
+### 9.2 Route API
 
 ```ts
-app.get(dynamicPath, handler);
+export const route = {
+  get(path: string, handler: Handler, options?: RouteOptions): RouteDefinition,
+  post(path: string, handler: Handler, options?: RouteOptions): RouteDefinition,
+  put(path: string, handler: Handler, options?: RouteOptions): RouteDefinition,
+  patch(path: string, handler: Handler, options?: RouteOptions): RouteDefinition,
+  delete(path: string, handler: Handler, options?: RouteOptions): RouteDefinition,
+  head(path: string, handler: Handler, options?: RouteOptions): RouteDefinition,
+  options(path: string, handler: Handler, options?: RouteOptions): RouteDefinition,
+};
+
+export function group(prefix: string, routes: RouteEntry[]): RouteGroup;
 ```
 
-动态路由不进入 OpenAPI，不保证出现在静态 route inspect 中。
+### 9.3 App API
+
+```ts
+export interface App {
+  use(middleware: Middleware): void;
+  route(method: HttpMethod, path: string, handler: Handler, options?: RouteOptions): void;
+  get(path: string, handler: Handler, options?: RouteOptions): void;
+  post(path: string, handler: Handler, options?: RouteOptions): void;
+  routes(routes: RouteEntry | RouteEntry[]): void;
+  listen(port: number, options?: ListenOptions): Promise<void>;
+}
+```
+
+`app.get/post/...` 是 runtime escape hatch。可运行，但只有满足静态子集时才进入 route inspect/OpenAPI。
 
 ---
 
-## 7. Context 设计
+## 10. 静态路由与 OpenAPI
+
+`forgets routes` 和 `forgets openapi` 只读取静态 route shape，不执行用户代码。
+
+扫描器必须基于 TypeScript/SWC AST，不允许用正则表达式解析路由。静态扫描是框架契约的一部分，必须能稳定处理 import、export、顶层 const、route factory、对象字面量和诊断位置。
+
+### 10.1 允许的静态子集
+
+```txt
+group prefix 是字符串字面量
+route path 是字符串字面量
+method 来自 route.get/post/put/patch/delete/head/options
+RouteOptions 是对象字面量
+schema 引用是顶层 const 或 import
+tags 是字符串字面量数组
+summary/description 是字符串字面量
+路由数组是顶层 const/export const，或 exported route factory 直接 return group(...)
+handler 表达式可以引用参数、闭包、controller，因为静态扫描不解析 handler 语义
+```
+
+允许：
 
 ```ts
+export function usersRoutes(controller: UsersController) {
+  return group("/users", [
+    route.get("/:id", ctx => controller.get(ctx), {
+      response: User,
+      tags: ["Users"],
+    }),
+  ]);
+}
+```
+
+### 10.2 不进入静态产物的写法
+
+```txt
+动态 path 拼接
+动态 method
+动态 tags
+动态 schema
+for/map/filter/reduce 生成路由
+运行时文件系统遍历
+dynamic import()
+app.get(dynamicPath, handler)
+```
+
+这些写法可以作为 escape hatch 运行，但 CLI 必须 warning，并排除在 `forgets routes` 和 OpenAPI 之外。
+
+### 10.3 CLI 输出
+
+```bash
+forgets routes
+```
+
+```txt
+GET     /users/:id      usersRoutes[0]
+POST    /users          usersRoutes[1]
+GET     /healthz        healthRoutes[0]
+GET     /readyz         healthRoutes[1]
+```
+
+```bash
+forgets openapi > openapi.json
+```
+
+---
+
+## 11. Context 与响应规则
+
+```ts
+export interface CancellationSignal {
+  aborted: boolean;
+  reason?: unknown;
+  onAbort(handler: () => void): void;
+}
+
 export interface Context {
-  request: Request;
+  request: RequestView;
   response: ResponseBuilder;
 
   method: string;
@@ -445,10 +1099,10 @@ export interface Context {
 
   params: Record<string, string>;
   query: QueryParams;
-  headers: Headers;
+  headers: HeaderBag;
 
   state: ContextState;
-  signal: AbortSignal;
+  signal?: CancellationSignal;
 
   json<T>(schema?: Schema<T>): Promise<T>;
   text(): Promise<string>;
@@ -459,26 +1113,42 @@ export interface Context {
 }
 ```
 
-返回值规则：
+`RequestView`、`HeaderBag` 是 forgets 自己的抽象。不要在第一版承诺完整 Web `Request` / `Headers` 兼容，除非 M0/M1 已经验证 Perry 对这些 API 的语义。
+
+`signal` 也是 forgets 自己的取消抽象。第一版只承诺它能表达“请求已被框架标记为超时/中止”，不承诺底层 IO 被真实取消。只有 M0/M1 证明 Perry 的 Abort/cancellation 语义可用后，才可以把它映射为完整 AbortSignal 行为。
+
+响应规则：
 
 ```txt
 object/array 自动 JSON 序列化
 string 默认 text/plain
+Uint8Array 默认 application/octet-stream
 ResponseBuilder 显式控制 status/header/body
 undefined 返回 204
+null 返回 JSON null，除非 ResponseBuilder 指定 204
 throw HttpError 走结构化错误响应
 throw Error 走 recovery
 ```
 
+这些规则由 `@forgets/http` wrapper 固定，不继承 Perry native fastify 的默认响应语义。
+
 ---
 
-## 8. Middleware 设计
+## 12. Middleware 与错误处理
 
-middleware 必须显式组合：
+### 12.1 Middleware
 
 ```ts
-export type Handler = (ctx: Context) => Promise<ResponseValue> | ResponseValue;
+export type ResponseValue =
+  | undefined
+  | null
+  | string
+  | Uint8Array
+  | Record<string, unknown>
+  | unknown[]
+  | ResponseBuilder;
 
+export type Handler = (ctx: Context) => Promise<ResponseValue> | ResponseValue;
 export type Middleware = (next: Handler) => Handler;
 ```
 
@@ -491,31 +1161,22 @@ app.use(timeout(30_000));
 app.use(accessLog(logger));
 ```
 
-路由级 middleware 放在 `RouteOptions`：
+执行顺序：
 
-```ts
-route.get("/admin", adminController.index, {
-  middleware: [auth(), requireRole("admin")],
-});
+```txt
+global middleware 按 app.use 顺序包裹
+route middleware 在 global middleware 之后、handler 之前执行
+recovery 应覆盖后续 middleware 和 handler
+accessLog 应在响应归一化后记录 status/duration
 ```
 
-不做 `@Use()`。
-
----
-
-## 9. 错误处理
-
-内置 `HttpError`：
+### 12.2 HttpError
 
 ```ts
 throw new HttpError(404, "User not found", {
   code: "USER_NOT_FOUND",
 });
-```
 
-快捷方法：
-
-```ts
 throw HttpError.notFound("User not found");
 throw HttpError.badRequest("Invalid body");
 throw HttpError.unauthorized("Unauthorized");
@@ -533,231 +1194,78 @@ throw HttpError.unauthorized("Unauthorized");
 }
 ```
 
-生产环境默认隐藏 stack。
+生产环境默认隐藏 stack，开发环境可以显示 stack。
 
-开发环境可以显示 stack。
+错误处理由 forgets wrapper 保证，不依赖 Perry native fastify 的 `setErrorHandler`、`onError` 或插件生命周期。
+
+### 12.3 Timeout
+
+第一版 timeout 语义：
+
+```txt
+超过时限返回 504
+记录 timeout error
+不承诺取消底层 in-flight IO
+不承诺 AbortSignal.timeout 真实取消
+```
+
+后续只有在 M0/M1 证明 Abort/cancellation 可用后，才升级为可取消语义。
 
 ---
 
-## 10. 包结构设计
+## 13. Runtime Driver
 
-建议 monorepo：
+第一版 driver：
 
 ```txt
-packages/
-  http/
-  schema/
-  config/
-  logger/
-  cli/
-  compiler/
-  runtime/
-  testing/
-examples/
-  hello-world/
-  rest-api/
-  sqlite-api/
-  postgres-api/
-  auth-api/
+Perry native fastify stdlib
 ```
 
-### `@forgets/http`
+但公开契约：
 
-负责 HTTP 应用模型：
-
-```ts
-createApp()
-route
-routes()
-group()
-Context
-HttpError
-Middleware
-Response helpers
+```txt
+@forgets/http App
+@forgets/http Context
+@forgets/http Middleware
+@forgets/http ResponseValue
+@forgets/http HttpError
 ```
 
-底层统一抽象：
+Driver interface：
 
 ```ts
-export interface Handler {
-  (ctx: Context): unknown | Promise<unknown>;
+export interface HttpDriver {
+  register(route: RuntimeRoute): void;
+  listen(port: number, options: ListenOptions): Promise<void>;
 }
 
-export interface Middleware {
-  (next: Handler): Handler;
+export interface RuntimeRoute {
+  method: HttpMethod;
+  path: string;
+  handler: Handler;
 }
 ```
 
-### `@forgets/schema`
-
-做轻量 schema，不直接绑定 Zod。
-
-原因：
+driver 适配层必须做：
 
 ```txt
-Perry 不支持 Reflect/metadata
-部分 npm 包可能依赖 Proxy、Symbol、Object descriptor 等能力
-自研小 schema 更容易保持 native-compatible
+把 Perry request 转成 forgets Context
+执行 middleware chain
+执行 handler
+执行 response normalization
+把 forgets response 写回 Perry reply
+捕获同步 throw 和 async rejection
 ```
 
-MVP 支持：
-
-```txt
-string
-number
-boolean
-object
-array
-enum
-literal
-optional
-nullable
-default
-min/max
-regex
-email
-uuid
-error formatting
-Infer<T>
-OpenAPI schema emit
-```
-
-后续再考虑：
-
-```txt
-union
-transform
-refine async
-custom error map
-typed client generation
-```
-
-### `@forgets/config`
-
-不要模块系统，直接：
-
-```ts
-const Config = schema.object({
-  PORT: schema.number().default(3000),
-  DATABASE_URL: schema.string(),
-  LOG_LEVEL: schema.enum(["debug", "info", "warn", "error"]).default("info"),
-});
-
-const config = loadConfig(Config);
-```
-
-支持：
-
-```txt
-env
-.env
-默认值
-类型转换
-启动时校验
-错误信息打印
-```
-
-### `@forgets/logger`
-
-内置结构化日志：
-
-```ts
-const logger = createLogger({
-  level: config.LOG_LEVEL,
-});
-
-logger.info("server started", {
-  port: config.PORT,
-});
-```
-
-输出 JSON：
-
-```json
-{
-  "level": "info",
-  "time": "2026-05-04T12:00:00.000Z",
-  "msg": "server started",
-  "port": 3000
-}
-```
-
-### `@forgets/runtime`
-
-短期目标不是重写 HTTP core，而是封装 Perry 已有 native HTTP 能力。
-
-第一版推荐：
-
-```txt
-使用 Perry native fastify stdlib 作为底层 driver
-forgets 暴露自己的 API，不暴露 Fastify 兼容承诺
-后续如果需要更强性能/控制，再迁移到自有 Rust/Perry HTTP core
-```
-
-### `@forgets/cli`
-
-命令：
-
-```bash
-forgets new my-api
-forgets dev
-forgets check
-forgets routes
-forgets openapi
-forgets build
-```
-
-解释：
-
-```txt
-forgets dev       开发期 watch/rebuild/run，尽量贴近 Perry runtime
-forgets check     forgets 规则检查 + Perry compatibility check
-forgets routes    打印静态路由表
-forgets openapi   生成 OpenAPI
-forgets build     生成 .forgets 构建产物并调用 perry compile
-```
+不要把这些语义交给 Fastify hooks，因为 Perry native fastify 的 hook/error/bodyLimit/close 语义还必须实测。
 
 ---
 
-## 11. Route Inspect 与 OpenAPI
+## 14. 构建与开发流程
 
-路由表必须可见。
+### 14.1 Build
 
-```bash
-forgets routes
-```
-
-输出：
-
-```txt
-GET     /users/:id      usersRoutes[0]
-POST    /users          usersRoutes[1]
-GET     /healthz        healthRoutes[0]
-GET     /readyz         healthRoutes[1]
-```
-
-OpenAPI 信息来自 `RouteOptions`：
-
-```ts
-route.post("/", ctx => usersController.create(ctx), {
-  body: CreateUser,
-  response: User,
-  summary: "Create user",
-  tags: ["Users"],
-});
-```
-
-命令：
-
-```bash
-forgets openapi > openapi.json
-```
-
----
-
-## 12. Native 构建流程
-
-Perry `compile` 需要单个入口 `.ts` 文件。因此 forgets build 负责生成 Perry 入口。
+Perry `compile` 需要单个入口。因此：
 
 ```txt
 src/main.ts
@@ -770,6 +1278,10 @@ generate .forgets/routes.generated.ts
   ↓
 generate .forgets/openapi.generated.json
   ↓
+generate .forgets/manifest.generated.json
+  ↓
+generate .forgets/diagnostics.generated.json
+  ↓
 generate .forgets/perry-entry.generated.ts
   ↓
 perry check .forgets/perry-entry.generated.ts
@@ -779,24 +1291,39 @@ perry compile .forgets/perry-entry.generated.ts -o dist/server
 dist/server
 ```
 
-命令：
+`.forgets/perry-entry.generated.ts` 只做三件事：
 
-```bash
-forgets build --target linux-x64 --release
+```txt
+导入用户 main/buildApp/config/deps
+导入 forgets runtime wrapper 和生成产物
+启动 HTTP driver
 ```
 
-部署：
+成功标准：
 
-```bash
-scp dist/server root@host:/app/server
-ssh root@host "systemctl restart forgets-server"
+```txt
+forgets 静态规则通过
+diagnostics 无 error 级别问题
+perry check generated entry 通过
+perry compile generated entry 通过
+native smoke test 必须启动并访问 healthz
+native HTTP behavior tests 必须覆盖 v1 承诺的生产语义
 ```
 
----
+v1 发布阻断项：
 
-## 13. 开发模式
+```txt
+undefined -> 204 native 行为不通过，阻断发布
+null -> JSON null native 行为不通过，阻断发布
+throw HttpError -> structured error native 行为不通过，阻断发布
+throw Error / async rejection -> recovery native 行为不通过，阻断发布
+bodyLimit native 行为不通过，阻断发布
+request id/access log native 行为不通过，阻断发布
+timeout response native 行为不通过，阻断发布
+routes/openapi/manifest/diagnostics JSON schema 校验不通过，阻断发布
+```
 
-### 默认 dev 模式
+### 14.2 Dev
 
 ```bash
 forgets dev
@@ -806,26 +1333,17 @@ forgets dev
 
 ```txt
 使用同一套 route/schema/config 入口
-尽量复用 Perry dev/compile 行为
+围绕 .forgets/perry-entry.generated.ts 生成和启动
+尽量复用或贴近 Perry dev/watch/recompile/relaunch
 watch 后重建 .forgets 构建产物
 禁止 dev-only API 泄漏到生产代码
 ```
 
-### Node/Bun simulator
-
-可以作为辅助测试手段，但不作为主语义来源。
-
-原因：
-
-```txt
-Node/Bun 支持的动态能力比 Perry 多
-过度依赖 simulator 会制造 dev/prod drift
-生产目标是 Perry native binary
-```
+Node/Bun simulator 可以存在，但只作为辅助测试手段，不作为主语义来源。
 
 ---
 
-## 14. 推荐项目结构
+## 15. 推荐项目结构
 
 ```txt
 my-api/
@@ -852,13 +1370,15 @@ my-api/
   .forgets/
     routes.generated.ts
     openapi.generated.json
+    manifest.generated.json
+    diagnostics.generated.json
     perry-entry.generated.ts
 
   forgets.config.ts
   package.json
 ```
 
-### `src/users/users.routes.ts`
+`src/users/users.routes.ts`：
 
 ```ts
 import { group, route } from "@forgets/http";
@@ -880,10 +1400,11 @@ export function usersRoutes(controller: UsersController) {
 }
 ```
 
-### `src/app.ts`
+`src/app.ts`：
 
 ```ts
 import { createApp } from "@forgets/http";
+import { accessLog, recovery, requestId, timeout } from "@forgets/middleware";
 import { usersRoutes } from "./users/users.routes";
 import { healthRoutes } from "./health/health.routes";
 
@@ -904,12 +1425,13 @@ export function buildApp(deps: AppDeps) {
 }
 ```
 
-### `src/main.ts`
+`src/main.ts`：
 
 ```ts
 import { loadConfig } from "@forgets/config";
 import { buildApp } from "./app";
 import { Config } from "./infra/config";
+import { buildDeps } from "./infra/deps";
 
 const config = loadConfig(Config);
 const deps = await buildDeps(config);
@@ -920,103 +1442,94 @@ await app.listen(config.PORT);
 
 ---
 
-## 15. 生产级能力清单
+## 16. 生产级能力清单
 
-第一版生产级最小能力：
+第一版最小生产能力：
 
 ```txt
 HTTP router
 JSON body parser
+body size limit
 schema validation
+response normalization
 structured error
 structured logger
 request id
 access log
 recovery
-timeout
-graceful shutdown
+timeout response
 healthz
 readyz
 config/env validation
 OpenAPI generation
 route inspect
+human-readable diagnostics
+machine-readable diagnostics
+AI context export
 Perry compatibility check
 native build
+native smoke test
 ```
 
-第二版：
+验证项，不作为第一版默认承诺：
 
 ```txt
-CORS
-cookie
-JWT helper
-rate limit
-metrics
-tracing
-static file
-multipart
-SQLite
-Postgres
-migration
-typed client generation
-```
-
-第三版：
-
-```txt
-WebSocket
-SSE
-message queue
-cron
-background worker
-RPC
-plugin system
+true graceful shutdown
+true request cancellation
+Fastify setErrorHandler/onError compatibility
+Fastify plugin compatibility
+full Web Request/Headers compatibility
 ```
 
 ---
 
-## 16. MVP 里程碑
+## 17. MVP 路线
 
 ### M0：Perry 能力验证
 
-目标：写 `docs/perry-compat.md`，固定 Perry 版本和实际测试结果。
+产物：
+
+```txt
+docs/perry-compat.md
+test-files/forgets-m0/*.ts
+scripts/forgets-m0.ps1
+```
 
 必须验证：
 
 ```txt
-class
-private fields/methods
-async/await
-Promise
+decorators rejected
+class/private fields/methods
+async/await/Promise
 Map/Set
 JSON parse/stringify
-fetch
-Perry native fastify server
-fs
 process.env
 timer
-AbortSignal
-进程信号/graceful shutdown
-Uint8Array
-TextEncoder/TextDecoder
-Perry check
-Perry compile single entry
+Uint8Array/TextEncoder/TextDecoder
+AbortController.abort
+AbortSignal.timeout
+dynamic import unsupported behavior
+perry check single generated entry
+perry compile single generated entry
+native fastify params/query/headers/body
+native fastify status/header/response body
+native fastify undefined/null baseline
+native fastify throw/rejection baseline
+native fastify bodyLimit baseline
+process.on signal/graceful shutdown baseline
 ```
 
-明确记录不可用能力：
+通过标准：
 
 ```txt
-decorators
-Reflect
-reflect-metadata
-dynamic import()
-Object descriptor/prototype mutation
-Node-only API
+每个能力有独立样例
+每个样例记录 check/compile/run 结果
+不稳定能力进入 docs/perry-compat.md 风险区
 ```
 
-### M1：最小 HTTP app
+### M1：最小 HTTP App
 
-代码：
+代码目标：
 
 ```ts
 const app = createApp();
@@ -1037,43 +1550,47 @@ JSON body
 JSON response
 status code
 headers
+undefined -> 204
+throw HttpError
+throw Error recovery
 ```
 
-### M2：显式 RouteDefinition
+M1 不能只通过 host unit tests。以上行为必须在 Perry native 二进制中验证，尤其是 undefined/null、throw/rejection、headers/status/body 顺序。
 
-代码：
+### M2：RouteDefinition 与静态扫描
+
+代码目标：
 
 ```ts
-const routes = group("/users", [
-  route.get("/:id", ctx => ({ id: ctx.params.id })),
-]);
-
-app.routes(routes);
+export function usersRoutes(controller: UsersController) {
+  return group("/users", [
+    route.get("/:id", ctx => controller.get(ctx), {
+      response: User,
+      tags: ["Users"],
+    }),
+  ]);
+}
 ```
 
 必须支持：
 
 ```txt
-route.get
-route.post
-route.put
-route.patch
-route.delete
-route.head
-route.options
+route.get/post/put/patch/delete/head/options
 group
 app.routes
-forgets routes
 duplicate route check
+static route inspect
+dynamic route warning
+AST scanner，不允许 regex scanner
 ```
 
-### M3：Schema
+### M3：Schema 与 OpenAPI
 
-代码：
+代码目标：
 
 ```ts
 const CreateUser = schema.object({
-  name: schema.string(),
+  name: schema.string().min(1),
 });
 
 route.post("/", async ctx => {
@@ -1081,35 +1598,32 @@ route.post("/", async ctx => {
   return input;
 }, {
   body: CreateUser,
+  response: CreateUser,
 });
 ```
 
 必须支持：
 
 ```txt
-object
-string
-number
-boolean
-array
-optional
-default
-enum
+parse/safeParse
+object/string/number/boolean/array
+optional/default/enum/literal/unknown
 error formatting
 OpenAPI emit
+config/env validation
 ```
 
-### M4：生产中间件与错误
+### M4：生产中间件与观测
 
 必须支持：
 
 ```txt
 request id
 recovery
-timeout
+timeout response
+body size limit
 access log
 structured logger
-HttpError
 default error response
 healthz
 readyz
@@ -1136,77 +1650,103 @@ dist/server
 curl localhost:3000/healthz
 ```
 
+M5 验收必须运行完整 native HTTP behavior suite：
+
+```txt
+healthz/readyz
+path params/query/header/body
+JSON response/status/header
+undefined -> 204
+null -> JSON null
+HttpError structured response
+unexpected Error recovery
+async rejection recovery
+body limit
+request id/access log
+timeout response
+```
+
+### M6：人体工程学与 AI 友好工具面
+
+必须支持：
+
+```txt
+diagnostic code
+human-readable diagnostic output
+JSON diagnostic output
+forgets routes --json
+forgets check --json
+forgets doctor --json
+forgets ai-context --json
+.forgets/manifest.generated.json
+.forgets/diagnostics.generated.json
+docs/schemas/manifest.schema.json
+docs/schemas/diagnostics.schema.json
+docs/schemas/ai-context.schema.json
+```
+
+通过标准：
+
+```txt
+同一个错误既能被人快速理解，也能被 AI/工具稳定引用
+manifest 不包含 secret 值
+AI context 能解释 route graph、schema names、config keys、Perry compatibility status
+```
+
 ---
 
-## 17. 数据库策略
+## 18. 数据库策略
 
 不要一上来做 ORM。
 
-Perry/native 生态下，数据库驱动是高风险部分。推荐三阶段：
-
-### 阶段一：用户自带 DB client
-
-框架不管 DB：
-
-```ts
-const db = new Database(config.DATABASE_URL);
-const usersRepo = new UsersRepository(db);
-```
-
-### 阶段二：提供 SQL interface
-
-```ts
-const rows = await db.query<UserRow>(
-  "select id, name from users where id = ?",
-  [id],
-);
-```
-
-### 阶段三：提供轻量 migration
-
-```ts
-export default migration("001_create_users", async db => {
-  await db.sql(`
-    create table users (
-      id text primary key,
-      name text not null,
-      email text not null
-    )
-  `);
-});
-```
-
-优先顺序：
+阶段一：
 
 ```txt
-SQLite
-PostgreSQL
-MySQL
+用户自带 DB client
+框架只负责 config/logger/error/http
 ```
+
+阶段二：
+
+```txt
+提供极薄 SQL interface
+优先 SQLite
+其次 PostgreSQL
+然后 MySQL
+```
+
+阶段三：
+
+```txt
+轻量 migration
+typed client generation
+```
+
+数据库驱动必须单独经过 Perry native compile/run 验证，不能只因 Perry stdlib 有路径就宣布生产可用。
 
 ---
 
-## 18. 和现有框架的对比
+## 19. 和现有框架的对比
 
 | 项目 | 重点 | forgets 的取舍 |
 | --- | --- | --- |
-| NestJS | 企业级 Node 框架，DI/Module/decorator 很强 | 不借鉴 decorator，不兼容 DI/Module |
+| NestJS | DI/Module/decorator 企业框架 | 不借鉴 decorator，不兼容 DI/Module |
 | Express | 极简 Node HTTP | 我们要 native build、schema、生产工具链 |
-| Fastify | 高性能 Node HTTP | 第一版可借 Perry native fastify driver，但不承诺 Fastify 插件兼容 |
-| Hono | 轻量 Web 标准 API | 借鉴轻量 handler 思想，不追求多 runtime |
+| Fastify | 高性能 Node HTTP | 第一版可借 Perry native fastify driver，但不承诺插件兼容 |
+| Hono | 轻量 handler 思想 | 借鉴 Context/Handler，不追求多 runtime |
 | Go net/http | 显式、稳定、部署简单 | 借鉴显式组合和生产部署形态 |
 | PerryTS | TS -> native compiler | 作为最终编译目标和能力边界 |
 
 ---
 
-## 19. README 核心文案
+## 20. README 核心文案
 
 ````md
 # forgets
 
 A native-first TypeScript backend framework for high-performance production services on Perry.
 
-forgets rejects decorators, reflection, dependency injection containers, and hidden lifecycle rules. Routes are explicit values. Dependencies are ordinary constructors. Runtime boundaries are schema-defined.
+forgets rejects decorators, reflection-based dependency injection, module containers, and hidden lifecycle rules. Routes are explicit values. Dependencies are ordinary constructors. Runtime boundaries are schema-defined.
 
 ```ts
 const users = new UsersService(new UsersRepository(db));
@@ -1227,42 +1767,11 @@ Explicit routes. Explicit dependencies. Native production first.
 
 ---
 
-## 20. 和 AI 继续讨论时，可以直接丢这个 Prompt
-
-```txt
-我想设计一个基于 PerryTS/native TypeScript 的生产级后端服务框架，项目名叫 forgets。
-
-核心理念：
-1. 完全废弃 Router Decorator，不做 @Controller/@Get/@Post。
-2. 不做 DI 容器、Module、Provider、Inject、Injectable、reflect-metadata。
-3. 依赖全部由用户显式 new 和组合。
-4. 路由使用显式 RouteDefinition value API，例如 group("/users", [route.get("/:id", handler)])。
-5. Handler 统一接受 Context，不做参数注入。
-6. Schema-first，所有 request body/query/params/config/response 都用 schema 显式描述。
-7. 支持 OpenAPI 生成、route inspect、Perry compatibility check、native single binary build。
-8. 构建期生成 .forgets/perry-entry.generated.ts，再调用 perry compile 单文件入口。
-9. 核心优先级是性能、稳定性、生产环境。
-10. 目标不是兼容 NestJS/Fastify 插件生态，而是在 Perry 能力边界内做显式、稳定、可部署的后端框架。
-
-请帮我从以下角度评审并完善：
-- RouteDefinition API 是否足够简洁？
-- 如何约束静态路由以支持 route inspect 和 OpenAPI？
-- Context 设计是否合理？
-- Schema 系统应该如何保持 Perry-compatible？
-- runtime driver 应先封装 Perry native fastify，还是直接写 Rust/Perry HTTP core？
-- 如何设计 middleware、error handling、graceful shutdown、observability？
-- MVP 应该如何拆分？
-- 哪些设计会损害性能、稳定性或生产环境确定性？
-- 哪些地方会和 PerryTS 当前能力冲突？
-```
-
----
-
 ## 21. 最终判断
 
-forgets 不再追求 NestJS 的表面写法。
+`forgets` 的关键不是模仿现有 Node 框架，而是在 Perry 当前能力边界内建立一个可编译、可检查、可部署的后端框架。
 
-真正要的是：
+最终形态：
 
 ```txt
 显式路由
@@ -1274,37 +1783,11 @@ native binary
 长期稳定运行
 ```
 
-最终形态应该是：
-
-```ts
-const app = createApp();
-
-app.use(requestId());
-app.use(recovery());
-app.use(timeout(30_000));
-app.use(accessLog(logger));
-
-app.routes([
-  healthRoutes(healthController),
-  usersRoutes(
-    new UsersController(
-      new UsersService(
-        new UsersRepository(db),
-      ),
-    ),
-  ),
-]);
-
-await app.listen(config.PORT);
-```
-
-这就是：
+这条路线牺牲了一些表面 DX，但换来的是：
 
 ```txt
-TypeScript 的表达力
-Go 式显式组合
-PerryTS 的部署形态
-生产环境优先的工程取舍
+更少运行时黑箱
+更强构建确定性
+更清晰生产边界
+更符合 Perry single-entry native compile 模型
 ```
-
-这个方向比“Native NestJS”更小、更硬、更符合 Perry 当前能力边界，也更可能做成真正可生产部署的框架。

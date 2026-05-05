@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://forgets.dev/schemas/ai-context.schema.json",
+  "title": "forgets AI context",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "framework",
+    "projectName",
+    "perryVersion",
+    "generatedEntry",
+    "routes",
+    "configKeys",
+    "diagnostics",
+    "nativeCompatibility"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "framework": {
+      "type": "string",
+      "const": "forgets"
+    },
+    "projectName": {
+      "type": "string"
+    },
+    "perryVersion": {
+      "type": "string"
+    },
+    "generatedEntry": {
+      "type": "string"
+    },
+    "routes": {
+      "type": "array",
+      "items": {
+        "$ref": "manifest.schema.json#/$defs/route"
+      }
+    },
+    "schemaNames": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "configKeys": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "diagnostics.schema.json#/$defs/diagnostic"
+      }
+    },
+    "nativeCompatibility": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["unknown", "passed", "failed"]
+        },
+        "perryCheck": {
+          "type": "string",
+          "enum": ["not-run", "passed", "failed"]
+        },
+        "perryCompile": {
+          "type": "string",
+          "enum": ["not-run", "passed", "failed"]
+        },
+        "nativeSmoke": {
+          "type": "string",
+          "enum": ["not-run", "passed", "failed"]
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

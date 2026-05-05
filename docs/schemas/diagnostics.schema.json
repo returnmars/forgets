@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://forgets.dev/schemas/diagnostics.schema.json",
+  "title": "forgets diagnostics",
+  "type": "object",
+  "required": ["schemaVersion", "diagnostics"],
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/diagnostic"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "diagnostic": {
+      "type": "object",
+      "required": ["code", "severity", "message"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^FORGETS_[A-Z0-9_]+$"
+        },
+        "severity": {
+          "type": "string",
+          "enum": ["error", "warning", "info"]
+        },
+        "message": {
+          "type": "string"
+        },
+        "file": {
+          "type": "string"
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "column": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "suggestion": {
+          "type": "string"
+        },
+        "docsUrl": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
