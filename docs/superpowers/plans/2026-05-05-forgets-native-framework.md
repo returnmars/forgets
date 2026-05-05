@@ -4,7 +4,7 @@
 
 **Goal:** Build the verified foundation for a production-ready, human-ergonomic, AI-friendly native TypeScript backend framework that developers write in TypeScript and compile to native binaries with Perry.
 
-**Architecture:** Start with Perry compatibility tests, then implement a small framework kernel with explicit routes, explicit dependencies, schema runtime values, middleware, and a Perry native fastify driver adapter. Keep Perry-specific behavior behind `@forgets/runtime`, and expose stable diagnostics, manifests, and JSON outputs so humans and AI tools can understand the project without executing user code.
+**Architecture:** Start with Perry compatibility tests, then implement a small framework kernel with explicit routes, explicit dependencies, schema runtime values, middleware, a clear concurrency contract, and a Perry native fastify driver adapter. Keep Perry-specific behavior behind `@forgets/runtime`, and expose stable diagnostics, manifests, and JSON outputs so humans and AI tools can understand the project without executing user code.
 
 **Tech Stack:** TypeScript, Vitest for host-side unit tests, Perry CLI for native check/compile smoke tests, Perry native fastify stdlib for the first HTTP driver.
 
@@ -93,8 +93,11 @@ examples/hello-world/forgets.config.ts
 
 test-files/forgets-m0/decorators-fail.ts
 test-files/forgets-m0/basic-runtime.ts
+test-files/forgets-m0/async-concurrency.ts
+test-files/forgets-m0/thread-spawn.ts
 test-files/forgets-m0/abort-timeout.ts
 test-files/forgets-m0/fastify-smoke.ts
+test-files/forgets-m0/fastify-concurrent.ts
 scripts/forgets-m0.ps1
 
 docs/perry-compat.md
@@ -823,8 +826,11 @@ git commit -m "feat(schema): add Perry-compatible schema MVP"
 **Files:**
 - Create: `test-files/forgets-m0/decorators-fail.ts`
 - Create: `test-files/forgets-m0/basic-runtime.ts`
+- Create: `test-files/forgets-m0/async-concurrency.ts`
+- Create: `test-files/forgets-m0/thread-spawn.ts`
 - Create: `test-files/forgets-m0/abort-timeout.ts`
 - Create: `test-files/forgets-m0/fastify-smoke.ts`
+- Create: `test-files/forgets-m0/fastify-concurrent.ts`
 - Create: `scripts/forgets-m0.ps1`
 - Modify: `docs/perry-compat.md`
 
@@ -868,7 +874,55 @@ console.log(JSON.stringify({
 }));
 ```
 
-- [ ] **Step 3: Add Abort fixture**
+- [ ] **Step 3: Add async concurrency fixture**
+
+```ts
+function delay(ms: number, value: string): Promise<string> {
+  return new Promise((resolve) => {
+    setTimeout(() => resolve(value), ms);
+  });
+}
+
+async function main() {
+  const started = Date.now();
+  const values = await Promise.all([
+    delay(20, "a"),
+    delay(20, "b"),
+    delay(20, "c"),
+  ]);
+
+  console.log(JSON.stringify({
+    values,
+    elapsedMs: Date.now() - started,
+  }));
+}
+
+await main();
+```
+
+- [ ] **Step 4: Add Perry thread fixture**
+
+```ts
+import { parallelMap, spawn } from "perry/thread";
+
+const task = spawn(() => {
+  let total = 0;
+  for (let i = 0; i < 1000; i++) {
+    total += i;
+  }
+  return total;
+});
+
+const doubled = parallelMap([1, 2, 3, 4], (value: number) => value * 2);
+const total = await task;
+
+console.log(JSON.stringify({
+  total,
+  doubled,
+}));
+```
+
+- [ ] **Step 5: Add Abort fixture**
 
 ```ts
 const controller = new AbortController();
@@ -889,7 +943,7 @@ console.log(JSON.stringify({
 }));
 ```
 
-- [ ] **Step 4: Add fastify smoke fixture**
+- [ ] **Step 6: Add fastify smoke fixture**
 
 ```ts
 import fastify from "fastify";
@@ -904,7 +958,33 @@ app.get("/healthz", async (_request, reply) => {
 app.listen({ port: 3000, host: "127.0.0.1" });
 ```
 
-- [ ] **Step 5: Add M0 PowerShell runner**
+- [ ] **Step 7: Add fastify concurrency smoke fixture**
+
+```ts
+import fastify from "fastify";
+
+const app = fastify();
+
+let inFlight = 0;
+let maxInFlight = 0;
+
+app.get("/wait", async (_request, reply) => {
+  inFlight += 1;
+  if (inFlight > maxInFlight) {
+    maxInFlight = inFlight;
+  }
+
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  inFlight -= 1;
+  reply.status(200);
+  return { maxInFlight };
+});
+
+app.listen({ port: 3001, host: "127.0.0.1" });
+```
+
+- [ ] **Step 8: Add M0 PowerShell runner**
 
 ```powershell
 $ErrorActionPreference = "Stop"
@@ -913,6 +993,8 @@ $Perry = "perry"
 $Cases = @(
   @{ Name = "decorators-fail"; File = "test-files/forgets-m0/decorators-fail.ts"; ExpectCheckFailure = $true },
   @{ Name = "basic-runtime"; File = "test-files/forgets-m0/basic-runtime.ts"; ExpectCheckFailure = $false },
+  @{ Name = "async-concurrency"; File = "test-files/forgets-m0/async-concurrency.ts"; ExpectCheckFailure = $false },
+  @{ Name = "thread-spawn"; File = "test-files/forgets-m0/thread-spawn.ts"; ExpectCheckFailure = $false },
   @{ Name = "abort-timeout"; File = "test-files/forgets-m0/abort-timeout.ts"; ExpectCheckFailure = $false }
 )
 
@@ -931,13 +1013,13 @@ foreach ($Case in $Cases) {
 }
 ```
 
-- [ ] **Step 6: Run M0 script**
+- [ ] **Step 9: Run M0 script**
 
 Run: `npm run m0`
 
-Expected: decorators fail check, basic runtime and abort fixture pass check. If `perry` is not on PATH, record the missing binary in `docs/perry-compat.md`.
+Expected: decorators fail check; basic runtime, async concurrency, thread spawn, and abort fixtures pass check. If `perry` is not on PATH, record the missing binary in `docs/perry-compat.md`.
 
-- [ ] **Step 7: Update compatibility document results**
+- [ ] **Step 10: Update compatibility document results**
 
 Add a `## M0 Results` section to `docs/perry-compat.md`:
 
@@ -948,11 +1030,14 @@ Add a `## M0 Results` section to `docs/perry-compat.md`:
 | --- | --- | --- | --- | --- |
 | decorators-fail | expected failure | not run | not run | Perry rejects decorators at lowering |
 | basic-runtime | not run | not run | not run | Records class/private/TextEncoder/Map/Promise behavior |
+| async-concurrency | not run | not run | not run | Records Promise.all/timer async behavior |
+| thread-spawn | not run | not run | not run | Records perry/thread spawn and parallelMap behavior |
 | abort-timeout | not run | not run | not run | Records AbortController and AbortSignal.timeout behavior |
 | fastify-smoke | not run | not run | not run | Requires separate server smoke command |
+| fastify-concurrent | not run | not run | not run | Requires native server plus parallel client requests |
 ```
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
 git add test-files/forgets-m0 scripts/forgets-m0.ps1 docs/perry-compat.md
@@ -1508,10 +1593,12 @@ git commit -m "feat(compiler): publish artifact JSON schema contracts"
 - [ ] No public API depends on decorators, `reflect-metadata`, or runtime type reflection.
 - [ ] Route factories remain statically inspectable without executing user code.
 - [ ] `@forgets/runtime` hides Perry native fastify details.
+- [ ] Concurrency contract states default async, explicit CPU parallelism, and per-request Context isolation.
 - [ ] Diagnostics have stable codes, human formatting, and JSON formatting.
 - [ ] AI context output excludes secret values and includes route/config/native facts.
 - [ ] Artifact JSON outputs have checked-in schemas under `docs/schemas`.
 - [ ] Host tests pass with `npm test`.
 - [ ] TypeScript passes with `npm run typecheck`.
 - [ ] M0 script records Perry check behavior with `npm run m0`.
+- [ ] M0/M1 native suites include async concurrency, perry/thread, concurrent requests, and CPU-bound offload behavior.
 - [ ] Native production claims are backed by Perry compile/run results.

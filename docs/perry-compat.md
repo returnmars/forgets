@@ -121,6 +121,41 @@ timeout v1 does not promise cancellation of in-flight IO.
 graceful shutdown requires a dedicated native test.
 ```
 
+### Async / Concurrency
+
+Perry uses a Tokio-backed bridge for native async stdlib operations, but TS code should not be described as automatically running every handler on Tokio worker threads.
+
+Source:
+
+```txt
+docs/perry-main-src/perry-main/docs/native-libraries.md
+docs/perry-main-src/perry-main/docs/src/language/supported-features.md
+docs/perry-main-src/perry-main/crates/perry-stdlib/src/common/async_bridge.rs
+docs/perry-main-src/perry-main/crates/perry-runtime/src/promise.rs
+docs/perry-main-src/perry-main/crates/perry-runtime/src/thread.rs
+docs/perry-main-src/perry-main/crates/perry-stdlib/src/framework/server.rs
+```
+
+Source-audited facts:
+
+```txt
+perry-stdlib has a global Tokio runtime for async native work.
+Promise completions are queued back to the Perry main-thread pump.
+Complex JSValue creation from async results is deferred to the main thread.
+perry/thread spawn and parallelMap use real OS threads with serialized/deep-copied values.
+The low-level HTTP server uses hyper + tokio for accept/connection I/O.
+```
+
+Framework decision:
+
+```txt
+Default async, explicit parallelism.
+I/O-bound handlers use async/await and do not expose Tokio to users.
+CPU-bound handlers must use perry/thread spawn/parallelMap or a native package.
+Do not promise automatic multi-core execution of every TS request handler.
+Concurrent request behavior, request isolation, and CPU-bound blocking must be native-tested.
+```
+
 ### Native Fastify
 
 Perry has a native fastify stdlib path covering route registration, listen, request params/query/header/body, and reply status/send APIs.
@@ -177,6 +212,11 @@ M0-017 undefined/null response baseline
 M0-018 handler throw/rejection baseline
 M0-019 bodyLimit baseline
 M0-020 process.on signal/graceful shutdown baseline
+M0-021 Promise.all async concurrency baseline
+M0-022 perry/thread spawn baseline
+M0-023 perry/thread parallelMap baseline
+M0-024 native fastify concurrent requests baseline
+M0-025 CPU-bound handler blocking/offload baseline
 ```
 
 ---
@@ -193,5 +233,7 @@ no decorator metadata
 no reflection DI
 single generated Perry entry
 driver hidden behind @forgets/http
+default async, explicit CPU parallelism
+per-request Context isolation
 Perry native smoke tests before production claims
 ```
