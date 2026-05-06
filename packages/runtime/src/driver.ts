@@ -455,9 +455,22 @@ function writeFastifyResponse(
 ): void {
   reply.code(response.status);
 
-  for (const name in response.headers) {
-    reply.header(name, response.headers[name]);
+  const headers = materializeHeaders(response.headers);
+  for (const name in headers) {
+    reply.header(name, headers[name]);
   }
 
   reply.send(response.body);
+}
+
+function materializeHeaders(
+  headers: Record<string, string>,
+): Record<string, string> {
+  const result: Record<string, string> = {};
+
+  for (const name in headers) {
+    result[name] = headers[name];
+  }
+
+  return result;
 }

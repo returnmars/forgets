@@ -18,6 +18,31 @@ describe("response normalization", () => {
     });
   });
 
+  it("maps null to JSON null", () => {
+    expect(normalizeResponse(null)).toEqual({
+      status: 200,
+      headers: { "content-type": "application/json" },
+      body: "null",
+    });
+  });
+
+  it("maps ResponseBuilder to explicit status, headers, and JSON body", () => {
+    expect(
+      normalizeResponse({
+        statusCode: 201,
+        headers: { "x-mode": "native" },
+        body: { created: true },
+      }),
+    ).toEqual({
+      status: 201,
+      headers: {
+        "content-type": "application/json",
+        "x-mode": "native",
+      },
+      body: JSON.stringify({ created: true }),
+    });
+  });
+
   it("maps HttpError to structured error body", () => {
     const response = normalizeResponse(
       HttpError.notFound("Missing", { code: "MISSING" }),

@@ -10,6 +10,7 @@ Workspace version: 0.5.494
 M0 CLI package: @perryts/perry 0.5.511
 Tracked upstream source: .forgets/perry-github-main
 Tracked upstream version: 0.5.585
+Local source status: 0.5.585 plus Fastify reply.header codegen patch
 Status: source-audit baseline plus M0/M1 native smoke evidence
 ```
 
@@ -38,6 +39,22 @@ cargo build --release -p perry-runtime -p perry-stdlib -p perry-ui-windows
 .forgets/perry-github-main/target/release/perry.exe --version
 perry 0.5.585
 ```
+
+Local source patch evidence:
+
+```txt
+.forgets/perry-github-main/crates/perry-codegen/src/lower_call.rs
+.forgets/perry-github-main/crates/perry-codegen/src/lower_call/native.rs
+```
+
+The source-built Perry used by M1 carries a small local codegen patch for Fastify response headers:
+
+```txt
+add fastify reply.header(name, value) -> js_fastify_reply_header
+select native module overloads by argument count before falling back to the first candidate
+```
+
+The upstream runtime already contains `js_fastify_reply_header`, but the checked codegen table did not route the npm Fastify reply `header(name, value)` method to it. Fastify request `header(name)` and reply `header(name, value)` share the same method name, so argument-count-aware native lookup is needed for this path. Until upstream includes an equivalent fix, custom response headers in the M1 native smoke require this source-built Perry baseline rather than stock npm `@perryts/perry 0.5.511`.
 
 Doctor evidence with source-built libraries:
 
@@ -285,10 +302,11 @@ Perry: source-built .forgets/perry-github-main/target/release/perry.exe 0.5.585
 Environment: PERRY_RUNTIME_DIR/PERRY_LIB_DIR=.forgets/perry-github-main/target/release
 Host Fastify dependency: fastify 5.8.5
 Result: perry check passed, perry compile passed, native run passed.
-Smoke: GET /healthz, POST /echo, request id, recovery, body limit, timeout, and access log passed.
+Smoke: GET /healthz, POST /echo, path params, undefined 204, null JSON, explicit status/header/body, HttpError, async rejection, request id, recovery, body limit, timeout, access log, and scheduler busy passed.
 Concurrent probe: slow async route completes, but /slow-started cannot observe it while pending; ConcurrentDispatch=serial-observed and StateIsolation=not-observed.
 Host tests cover RequestScheduler admission behavior and Fastify driver busy 503 normalization.
-Artifact: .forgets/m1-http/results.json records Healthz=passed, Echo=passed, RequestId=passed, Recovery=passed, BodyLimit=passed, Timeout=passed, AccessLog=passed, ConcurrentDispatch=serial-observed, and StateIsolation=not-observed.
+Runtime driver note: writeFastifyResponse materializes normalized headers before calling reply.header(), because native smoke exposed a Perry boundary where direct iteration over the normalized header object did not reliably emit custom headers.
+Artifact: .forgets/m1-http/results.json records Healthz=passed, Echo=passed, Params=passed, Undefined=passed, Null=passed, StatusHeader=passed, HttpError=passed, AsyncRejection=passed, RequestId=passed, Recovery=passed, BodyLimit=passed, Timeout=passed, AccessLog=passed, SchedulerBusy=passed, ConcurrentDispatch=serial-observed, and StateIsolation=not-observed.
 Server log: "forgets ready port=<port>" and "Server listening on http://0.0.0.0:<port>".
 Audit: npm audit --omit=dev found 0 vulnerabilities after upgrading Fastify to 5.8.5.
 ```
@@ -403,15 +421,16 @@ Command: npm run m1:http
 Perry: source-built .forgets/perry-github-main/target/release/perry.exe 0.5.585
 Environment: PERRY_RUNTIME_DIR/PERRY_LIB_DIR=.forgets/perry-github-main/target/release
 Result: perry check passed; perry compile passed; native run passed.
-Smoke: GET /healthz, POST /echo, request id, recovery, body limit, timeout, and access log passed.
+Smoke: GET /healthz, POST /echo, path params, undefined 204, null JSON, explicit status/header/body, HttpError, async rejection, request id, recovery, body limit, timeout, access log, and scheduler busy passed.
 Concurrent probe: Fastify-backed native TS route dispatch is serial-observed; true concurrent TS route state isolation is not-observed.
 Request admission: @forgets/runtime routes Fastify-backed handlers through RequestScheduler for maxConcurrentRequests/requestQueueLimit/queueTimeoutMs and structured FORGETS_BUSY 503 responses.
-Artifact: .forgets/m1-http/results.json records Check=passed, Compile=passed, Run=passed, Healthz=passed, Echo=passed, RequestId=passed, Recovery=passed, BodyLimit=passed, Timeout=passed, AccessLog=passed, ConcurrentDispatch=serial-observed, and StateIsolation=not-observed.
+Response headers: custom status/header/body responses pass on source-built Perry 0.5.585 plus the local Fastify reply.header codegen patch.
+Artifact: .forgets/m1-http/results.json records Check=passed, Compile=passed, Run=passed, Healthz=passed, Echo=passed, Params=passed, Undefined=passed, Null=passed, StatusHeader=passed, HttpError=passed, AsyncRejection=passed, RequestId=passed, Recovery=passed, BodyLimit=passed, Timeout=passed, AccessLog=passed, SchedulerBusy=passed, ConcurrentDispatch=serial-observed, and StateIsolation=not-observed.
 ```
 
 | Case | Check | Compile | Run | Notes |
 | --- | --- | --- | --- | --- |
-| native-http-smoke | passed | passed | passed | Fastify-backed `createNativeHttpDriver(app).listen(port)`; `/healthz`, `/echo`, request id, recovery, body limit, timeout, and access log passed; concurrent TS route dispatch recorded as serial-observed |
+| native-http-smoke | passed | passed | passed | Fastify-backed `createNativeHttpDriver(app).listen(port)`; `/healthz`, `/echo`, params, undefined/null, status/header/body, HttpError, async rejection, request id, recovery, body limit, timeout, access log, and scheduler busy passed; concurrent TS route dispatch recorded as serial-observed |
 | raw native-http-smoke | passed | failed | not-run | historical `js_http_*` experiment; unresolved with auto-optimize features=(no optional features) |
 | raw native-http-smoke --no-auto-optimize | not-scripted | passed | failed | historical control; full stdlib links, server starts, `/healthz` times out |
 

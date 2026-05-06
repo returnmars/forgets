@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createApp } from "../../http/src/index";
+import { createApp, HttpError } from "../../http/src/index";
 import {
   createFastifyHttpDriver,
   createRequestScheduler,
@@ -149,6 +149,80 @@ describe("native HTTP driver", () => {
     expect(response.statusCode).toBe(503);
     expect(response.body).toBe(
       '{"error":{"code":"FORGETS_BUSY","message":"Server Busy","status":503}}',
+    );
+
+    await server.close();
+  });
+
+  it("normalizes M1 response boundary behavior on a Fastify server", async () => {
+    const app = createApp();
+    app.get("/users/:id", (ctx) => ({ id: ctx.params.id }));
+    app.get("/undefined", () => undefined);
+    app.get("/null", () => null);
+    app.get("/status-header", (ctx) => {
+      ctx.set("x-mode", "native");
+      const response = ctx.status(201);
+      response.headers["x-route"] = "status";
+      response.body = { created: true };
+      return response;
+    });
+    app.get("/http-error", () => {
+      throw HttpError.badRequest("Bad Native Request", { code: "BAD_NATIVE" });
+    });
+    app.get("/async-rejection", async () => {
+      await Promise.resolve();
+      throw new Error("async boom");
+    });
+
+    const server = createFastifyHttpDriver(app).buildServer();
+
+    const params = await server.inject({
+      method: "GET",
+      url: "/users/ada",
+    });
+    expect(params.statusCode).toBe(200);
+    expect(params.body).toBe('{"id":"ada"}');
+
+    const undefinedResponse = await server.inject({
+      method: "GET",
+      url: "/undefined",
+    });
+    expect(undefinedResponse.statusCode).toBe(204);
+    expect(undefinedResponse.body).toBe("");
+
+    const nullResponse = await server.inject({
+      method: "GET",
+      url: "/null",
+    });
+    expect(nullResponse.statusCode).toBe(200);
+    expect(nullResponse.headers["content-type"]).toContain("application/json");
+    expect(nullResponse.body).toBe("null");
+
+    const statusHeader = await server.inject({
+      method: "GET",
+      url: "/status-header",
+    });
+    expect(statusHeader.statusCode).toBe(201);
+    expect(statusHeader.headers["x-mode"]).toBe("native");
+    expect(statusHeader.headers["x-route"]).toBe("status");
+    expect(statusHeader.body).toBe('{"created":true}');
+
+    const httpError = await server.inject({
+      method: "GET",
+      url: "/http-error",
+    });
+    expect(httpError.statusCode).toBe(400);
+    expect(httpError.body).toBe(
+      '{"error":{"code":"BAD_NATIVE","message":"Bad Native Request","status":400}}',
+    );
+
+    const asyncRejection = await server.inject({
+      method: "GET",
+      url: "/async-rejection",
+    });
+    expect(asyncRejection.statusCode).toBe(500);
+    expect(asyncRejection.body).toBe(
+      '{"error":{"code":"FORGETS_INTERNAL_ERROR","message":"Internal Server Error","status":500}}',
     );
 
     await server.close();

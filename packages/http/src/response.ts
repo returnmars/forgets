@@ -1,4 +1,5 @@
 import { isHttpError } from "./error";
+import type { ResponseBuilder } from "./types";
 
 export interface NormalizedResponse {
   status: number;
@@ -21,6 +22,10 @@ export function normalizeResponse(value: unknown): NormalizedResponse {
     return { status: 204, headers: {}, body: undefined };
   }
 
+  if (isResponseBuilder(value)) {
+    return normalizeResponseBuilder(value);
+  }
+
   if (typeof value === "string") {
     return {
       status: 200,
@@ -38,6 +43,38 @@ export function normalizeResponse(value: unknown): NormalizedResponse {
   }
 
   return json(200, value);
+}
+
+function normalizeResponseBuilder(value: ResponseBuilder): NormalizedResponse {
+  if (value.body === undefined) {
+    return {
+      status: value.statusCode,
+      headers: { ...value.headers },
+      body: undefined,
+    };
+  }
+
+  const body = normalizeResponse(value.body);
+  return {
+    status: value.statusCode,
+    headers: { ...body.headers, ...value.headers },
+    body: body.body,
+  };
+}
+
+function isResponseBuilder(value: unknown): value is ResponseBuilder {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.statusCode === "number" &&
+    record.headers !== null &&
+    typeof record.headers === "object" &&
+    !Array.isArray(record.headers) &&
+    "body" in record
+  );
 }
 
 function json(status: number, value: unknown): NormalizedResponse {

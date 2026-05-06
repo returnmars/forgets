@@ -38,11 +38,18 @@ $Result = [ordered]@{
   Run = "not-run"
   Healthz = "not-run"
   Echo = "not-run"
+  Params = "not-run"
+  Undefined = "not-run"
+  Null = "not-run"
+  StatusHeader = "not-run"
+  HttpError = "not-run"
+  AsyncRejection = "not-run"
   RequestId = "not-run"
   Recovery = "not-run"
   BodyLimit = "not-run"
   Timeout = "not-run"
   AccessLog = "not-run"
+  SchedulerBusy = "not-run"
   ConcurrentDispatch = "not-run"
   StateIsolation = "not-run"
   Notes = ""
@@ -120,6 +127,106 @@ function Invoke-Curl {
   } finally {
     $ErrorActionPreference = $PreviousErrorActionPreference
   }
+}
+
+function Invoke-CurlHttp {
+  param([string[]]$Arguments)
+
+  $Id = [Guid]::NewGuid().ToString("N")
+  $BodyPath = Join-Path $OutDir "curl-$Id.body"
+  $HeaderPath = Join-Path $OutDir "curl-$Id.headers"
+  $CurlArgs = @(
+    "-sS",
+    "--max-time",
+    "2",
+    "-D",
+    $HeaderPath,
+    "-o",
+    $BodyPath,
+    "-w",
+    "%{http_code}"
+  ) + $Arguments
+
+  $Curl = Invoke-Curl $CurlArgs
+  $Body = ""
+  $Headers = ""
+
+  if (Test-Path $BodyPath) {
+    $RawBody = Get-Content -Raw $BodyPath
+    if ($null -ne $RawBody) {
+      $Body = [string]$RawBody
+    }
+  }
+
+  if (Test-Path $HeaderPath) {
+    $RawHeaders = Get-Content -Raw $HeaderPath
+    if ($null -ne $RawHeaders) {
+      $Headers = [string]$RawHeaders
+    }
+  }
+
+  Remove-Item -Force -ErrorAction SilentlyContinue $BodyPath, $HeaderPath
+
+  $StatusText = $Curl.Text.Trim()
+  $StatusCode = 0
+  if ($StatusText -match "^\d+$") {
+    $StatusCode = [int]$StatusText
+  }
+
+  return [ordered]@{
+    ExitCode = $Curl.ExitCode
+    Output = $Curl.Output
+    StatusCode = $StatusCode
+    Body = $Body
+    Headers = $Headers
+  }
+}
+
+function Assert-HttpResponse {
+  param(
+    [string]$Field,
+    [object]$Response,
+    [int]$ExpectedStatus,
+    [string]$ExpectedBody,
+    [string[]]$HeaderPatterns = @()
+  )
+
+  $HeaderFailure = ""
+  foreach ($Pattern in $HeaderPatterns) {
+    if ($Response.Headers -notmatch $Pattern) {
+      $HeaderFailure = $Pattern
+      break
+    }
+  }
+
+  if (
+    $Response.ExitCode -ne 0 `
+      -or $Response.StatusCode -ne $ExpectedStatus `
+      -or $Response.Body -ne $ExpectedBody `
+      -or $HeaderFailure -ne ""
+  ) {
+    $script:Result[$Field] = "failed"
+    $script:Result.Diagnostics = [ordered]@{
+      Field = $Field
+      CurlExitCode = $Response.ExitCode
+      CurlOutput = $Response.Output
+      StatusCode = $Response.StatusCode
+      ExpectedStatus = $ExpectedStatus
+      Body = $Response.Body
+      ExpectedBody = $ExpectedBody
+      Headers = $Response.Headers
+      MissingHeaderPattern = $HeaderFailure
+      ServerExited = $Process.HasExited
+      ServerExitCode = if ($Process.HasExited) { $Process.ExitCode } else { $null }
+      ServerStdout = Read-LogTail $StdOut
+      ServerStderr = Read-LogTail $StdErr
+    }
+    $script:Result.Notes = "Unexpected $Field response"
+    Save-Result
+    throw "native-http-smoke $Field request failed"
+  }
+
+  $script:Result[$Field] = "passed"
 }
 
 Write-Host "== native-http-smoke: perry check =="
@@ -361,6 +468,144 @@ try {
   }
 
   $Result.AccessLog = "passed"
+
+  $Params = Invoke-CurlHttp @(
+    "http://127.0.0.1:$Port/users/ada"
+  )
+  Assert-HttpResponse `
+    -Field "Params" `
+    -Response $Params `
+    -ExpectedStatus 200 `
+    -ExpectedBody '{"id":"ada"}'
+
+  $Undefined = Invoke-CurlHttp @(
+    "http://127.0.0.1:$Port/undefined"
+  )
+  Assert-HttpResponse `
+    -Field "Undefined" `
+    -Response $Undefined `
+    -ExpectedStatus 204 `
+    -ExpectedBody ""
+
+  $NullResponse = Invoke-CurlHttp @(
+    "http://127.0.0.1:$Port/null"
+  )
+  Assert-HttpResponse `
+    -Field "Null" `
+    -Response $NullResponse `
+    -ExpectedStatus 200 `
+    -ExpectedBody "null" `
+    -HeaderPatterns @("(?im)^content-type:\s*application/json")
+
+  $StatusHeader = Invoke-CurlHttp @(
+    "http://127.0.0.1:$Port/status-header"
+  )
+  Assert-HttpResponse `
+    -Field "StatusHeader" `
+    -Response $StatusHeader `
+    -ExpectedStatus 201 `
+    -ExpectedBody '{"created":true}' `
+    -HeaderPatterns @(
+      "(?im)^x-mode:\s*native\s*$",
+      "(?im)^x-route:\s*status\s*$"
+    )
+
+  $HttpError = Invoke-CurlHttp @(
+    "http://127.0.0.1:$Port/http-error"
+  )
+  Assert-HttpResponse `
+    -Field "HttpError" `
+    -Response $HttpError `
+    -ExpectedStatus 400 `
+    -ExpectedBody '{"error":{"code":"BAD_NATIVE","message":"Bad Native Request","status":400}}'
+
+  $AsyncRejection = Invoke-CurlHttp @(
+    "http://127.0.0.1:$Port/async-rejection"
+  )
+  Assert-HttpResponse `
+    -Field "AsyncRejection" `
+    -Response $AsyncRejection `
+    -ExpectedStatus 500 `
+    -ExpectedBody '{"error":{"code":"FORGETS_INTERNAL_ERROR","message":"Internal Server Error","status":500}}'
+
+  $BusyPort = Get-Random -Minimum 43100 -Maximum 48999
+  $BusyStdOut = Join-Path $OutDir "busy-server.out.log"
+  $BusyStdErr = Join-Path $OutDir "busy-server.err.log"
+  Remove-Item -Force -ErrorAction SilentlyContinue $BusyStdOut, $BusyStdErr
+
+  $BusyProcess = Start-Process `
+    -FilePath $Binary `
+    -ArgumentList @($BusyPort, "busy") `
+    -PassThru `
+    -RedirectStandardOutput $BusyStdOut `
+    -RedirectStandardError $BusyStdErr `
+    -WindowStyle Hidden
+
+  try {
+    $Busy = $null
+    for ($Attempt = 0; $Attempt -lt 40; $Attempt += 1) {
+      Start-Sleep -Milliseconds 250
+      $BusyProcess.Refresh()
+      if ($BusyProcess.HasExited) {
+        break
+      }
+
+      $Busy = Invoke-CurlHttp @(
+        "http://127.0.0.1:$BusyPort/busy"
+      )
+      if (
+        $Busy.ExitCode -eq 0 `
+          -and $Busy.StatusCode -eq 503 `
+          -and $Busy.Body -eq '{"error":{"code":"FORGETS_BUSY","message":"Server Busy","status":503}}'
+      ) {
+        break
+      }
+    }
+
+    if ($null -eq $Busy) {
+      $Busy = [ordered]@{
+        ExitCode = 1
+        Output = @("busy server did not respond")
+        StatusCode = 0
+        Body = ""
+        Headers = ""
+      }
+    }
+
+    if (
+      $Busy.ExitCode -ne 0 `
+        -or $Busy.StatusCode -ne 503 `
+        -or $Busy.Body -ne '{"error":{"code":"FORGETS_BUSY","message":"Server Busy","status":503}}'
+    ) {
+      $Result.SchedulerBusy = "failed"
+      $Result.Diagnostics = [ordered]@{
+        BusyExitCode = $Busy.ExitCode
+        BusyOutput = $Busy.Output
+        BusyStatusCode = $Busy.StatusCode
+        BusyBody = $Busy.Body
+        BusyHeaders = $Busy.Headers
+        BusyServerExited = $BusyProcess.HasExited
+        BusyServerExitCode = if ($BusyProcess.HasExited) { $BusyProcess.ExitCode } else { $null }
+        BusyServerStdout = Read-LogTail $BusyStdOut
+        BusyServerStderr = Read-LogTail $BusyStdErr
+        ServerExited = $Process.HasExited
+        ServerExitCode = if ($Process.HasExited) { $Process.ExitCode } else { $null }
+        ServerStdout = Read-LogTail $StdOut
+        ServerStderr = Read-LogTail $StdErr
+      }
+      $Result.Notes = "Unexpected SchedulerBusy response"
+      Save-Result
+      throw "native-http-smoke scheduler busy request failed"
+    }
+
+    $Result.SchedulerBusy = "passed"
+  } finally {
+    if ($BusyProcess -and -not $BusyProcess.HasExited) {
+      Stop-Process -Id $BusyProcess.Id -Force
+      Wait-Process -Id $BusyProcess.Id -ErrorAction SilentlyContinue
+    }
+  }
+
   $SlowBodyPath = Join-Path $OutDir "slow.body.txt"
   $SlowErrPath = Join-Path $OutDir "slow.err.log"
   Remove-Item -Force -ErrorAction SilentlyContinue $SlowBodyPath, $SlowErrPath
