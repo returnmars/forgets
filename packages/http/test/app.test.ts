@@ -43,4 +43,64 @@ describe("app registry", () => {
       "Duplicate route: GET /healthz",
     );
   });
+
+  it("composes app and route middleware for dispatch", async () => {
+    const app = createApp();
+    const calls: string[] = [];
+
+    app.use((next) => async (ctx) => {
+      calls.push("app:before");
+      ctx.state.scope = "global";
+      const value = await next(ctx);
+      calls.push("app:after");
+      return value;
+    });
+
+    app.routes(route.get("/healthz", (ctx) => {
+      calls.push(String(ctx.state.scope));
+      return { ok: true };
+    }, {
+      middleware: [
+        (next) => async (ctx) => {
+          calls.push("route:before");
+          const value = await next(ctx);
+          calls.push("route:after");
+          return value;
+        },
+      ],
+    }));
+
+    const [inspected] = app.inspectRoutes();
+    const value = await inspected.handler({
+      method: "GET",
+      path: "/healthz",
+      params: {},
+      query: {},
+      headers: {},
+      state: {},
+      async json<T>(schema?: { parse(value: unknown): T }) {
+        const value = {};
+        return schema ? schema.parse(value) : value as T;
+      },
+      async text() {
+        return "";
+      },
+      async bytes() {
+        return new Uint8Array();
+      },
+      status(statusCode) {
+        return { statusCode, headers: {}, body: undefined };
+      },
+      set() {},
+    });
+
+    expect(value).toEqual({ ok: true });
+    expect(calls).toEqual([
+      "app:before",
+      "route:before",
+      "global",
+      "route:after",
+      "app:after",
+    ]);
+  });
 });

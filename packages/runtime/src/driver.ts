@@ -5,6 +5,7 @@ import Fastify, {
 } from "fastify";
 import {
   HttpError,
+  isHttpError,
   normalizeResponse,
   type App,
   type InspectedRoute,
@@ -274,7 +275,7 @@ async function handleFastifySnapshot(
   );
 
   try {
-    const value = await inspected.route.handler(ctx);
+    const value = await inspected.handler(ctx);
     const response = normalizeResponse(value);
     writeFastifyResponse(reply, {
       ...response,
@@ -282,7 +283,7 @@ async function handleFastifySnapshot(
     });
   } catch (error) {
     const response =
-      error instanceof HttpError
+      isHttpError(error)
         ? normalizeResponse(error)
         : normalizeResponse(
             HttpError.internal("Internal Server Error", {

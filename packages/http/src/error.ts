@@ -3,6 +3,14 @@ export interface HttpErrorOptions {
   details?: unknown;
 }
 
+export interface HttpErrorLike extends Record<string, unknown> {
+  name?: string;
+  status: number;
+  code: string;
+  message: string;
+  details?: unknown;
+}
+
 export class HttpError extends Error {
   readonly status: number;
   readonly code: string;
@@ -34,4 +42,24 @@ export class HttpError extends Error {
   ) {
     return new HttpError(500, message, options);
   }
+}
+
+export function isHttpError(value: unknown): value is HttpErrorLike {
+  if (value instanceof HttpError) {
+    return true;
+  }
+
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const record = value as Record<string, unknown>;
+  return (
+    record.name === "HttpError" &&
+    typeof record.status === "number" &&
+    record.status >= 400 &&
+    record.status <= 599 &&
+    typeof record.code === "string" &&
+    typeof record.message === "string"
+  );
 }

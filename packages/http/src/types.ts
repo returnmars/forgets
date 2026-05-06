@@ -1,3 +1,5 @@
+import type { HttpError } from "./error";
+
 export type HttpMethod =
   | "GET"
   | "POST"
@@ -25,7 +27,8 @@ export type ResponseValue =
   | Uint8Array
   | Record<string, unknown>
   | unknown[]
-  | ResponseBuilder;
+  | ResponseBuilder
+  | HttpError;
 
 export interface CancellationSignal {
   aborted: boolean;

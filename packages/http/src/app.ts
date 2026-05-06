@@ -11,6 +11,7 @@ import type {
 export interface InspectedRoute {
   method: HttpMethod;
   path: string;
+  handler: Handler;
   route: RouteDefinition;
 }
 
@@ -30,7 +31,7 @@ export interface App {
 
 export function createApp(): App {
   const middleware: Middleware[] = [];
-  const registered: InspectedRoute[] = [];
+  const registered: Array<Omit<InspectedRoute, "handler">> = [];
   const keys = new Set<string>();
 
   function addRoute(prefix: string, entry: RouteEntry): void {
@@ -72,9 +73,25 @@ export function createApp(): App {
       }
     },
     inspectRoutes() {
-      return [...registered];
+      return registered.map((entry) => ({
+        ...entry,
+        handler: composeHandler(entry.route.handler, [
+          ...middleware,
+          ...(entry.route.options.middleware ?? []),
+        ]),
+      }));
     },
   };
+}
+
+function composeHandler(handler: Handler, middleware: Middleware[]): Handler {
+  let current = handler;
+
+  for (let index = middleware.length - 1; index >= 0; index -= 1) {
+    current = middleware[index](current);
+  }
+
+  return current;
 }
 
 export function joinPaths(prefix: string, path: string): string {

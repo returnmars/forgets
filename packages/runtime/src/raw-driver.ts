@@ -70,7 +70,7 @@ export function createTransportHttpDriver(
 
     const responseHeaders: Record<string, string> = {};
     const ctx = createContext(snapshot, responseHeaders);
-    const value = await matched.route.handler(ctx);
+    const value = await matched.handler(ctx);
     const response = normalizeResponse(value);
 
     writeNormalized(transport, request, {

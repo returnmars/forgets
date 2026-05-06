@@ -1,4 +1,4 @@
-import { HttpError } from "./error";
+import { isHttpError } from "./error";
 
 export interface NormalizedResponse {
   status: number;
@@ -7,7 +7,7 @@ export interface NormalizedResponse {
 }
 
 export function normalizeResponse(value: unknown): NormalizedResponse {
-  if (value instanceof HttpError) {
+  if (isHttpError(value)) {
     return json(value.status, {
       error: {
         code: value.code,

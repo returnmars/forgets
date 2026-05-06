@@ -32,4 +32,22 @@ describe("response normalization", () => {
       },
     });
   });
+
+  it("maps HttpError-shaped values to structured error body", () => {
+    const response = normalizeResponse({
+      name: "HttpError",
+      status: 500,
+      code: "FORGETS_INTERNAL_ERROR",
+      message: "Internal Server Error",
+    });
+
+    expect(response.status).toBe(500);
+    expect(JSON.parse(String(response.body))).toEqual({
+      error: {
+        code: "FORGETS_INTERNAL_ERROR",
+        message: "Internal Server Error",
+        status: 500,
+      },
+    });
+  });
 });
