@@ -7,9 +7,12 @@
     "schemaVersion",
     "framework",
     "projectName",
+    "forgetsVersion",
     "perryVersion",
+    "packages",
     "generatedEntry",
     "routes",
+    "schemaNames",
     "configKeys",
     "diagnostics",
     "nativeCompatibility"
@@ -26,8 +29,17 @@
     "projectName": {
       "type": "string"
     },
+    "forgetsVersion": {
+      "type": "string"
+    },
     "perryVersion": {
       "type": "string"
+    },
+    "packages": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
     },
     "generatedEntry": {
       "type": "string"
@@ -58,7 +70,7 @@
     },
     "nativeCompatibility": {
       "type": "object",
-      "required": ["status"],
+      "required": ["status", "perryCheck", "perryCompile", "nativeSmoke"],
       "properties": {
         "status": {
           "type": "string",

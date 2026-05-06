@@ -4,74 +4,104 @@
 
 **Goal:** Build the verified foundation for a production-ready, human-ergonomic, AI-friendly native TypeScript backend framework that developers write in TypeScript and compile to native binaries with Perry.
 
-**Architecture:** Start with Perry compatibility tests, then implement a small framework kernel with explicit routes, explicit dependencies, schema runtime values, middleware, a clear concurrency contract, and a Perry native fastify driver adapter. Keep Perry-specific behavior behind `@forgets/runtime`, and expose stable diagnostics, manifests, and JSON outputs so humans and AI tools can understand the project without executing user code.
+**Architecture:** Start with Perry compatibility tests, then implement a small framework kernel with explicit routes, explicit dependencies, schema runtime values, and a clear contract for a first-party Perry-native HTTP driver. Keep Perry-specific behavior behind `@forgets/runtime`, and expose stable diagnostics, manifests, and JSON outputs so humans and AI tools can understand the project without executing user code.
 
-**Tech Stack:** TypeScript, Vitest for host-side unit tests, Perry CLI for native check/compile smoke tests, Perry native fastify stdlib for the first HTTP driver.
+**Tech Stack:** TypeScript for public framework packages, compiler, CLI, and host-side tests; PerryTS for final native check/compile/run validation; Rust only as Perry source reference and necessary stdlib/FFI/native-module patch surface; Vite+ as the recommended workspace scaffold/tooling layer, not as runtime or native build contract.
 
 ---
 
 ## Scope
 
-This plan implements the foundation line:
+This plan starts the foundation line:
 
 ```txt
-M0 Perry compatibility baseline
-M1 HTTP app kernel
-M2 RouteDefinition and static route model
-M3 schema MVP and OpenAPI emit
-M4 production middleware baseline
-M5 generated Perry entry and native build smoke test
-M6 human-readable diagnostics and AI-readable project context
+M0 Perry compatibility baseline fixtures
+M1 HTTP app kernel seed
+M2 RouteDefinition and static route model seed
+M3 schema MVP seed
+M5 generated Perry entry seed
+M6 human-readable diagnostics and AI-readable project context seed
 ```
 
 The full production framework also includes database packages, auth helpers, metrics/tracing, WebSocket/SSE, workers, and deployment templates. Those are separate follow-up plans after this foundation can compile and run under Perry.
+
+This document is the seed implementation plan for the kernel, route values, schema MVP, static scanner, generated entry, diagnostics, and artifact schemas. Runtime driver internals, production middleware, OpenAPI document emission, CLI commands, and the full native HTTP behavior suite require follow-up tasks before any production claim.
+
+The toolchain decision is documented in `docs/forgets-toolchain.md`. Keep this plan runnable through plain npm/perry commands, even if Vite+ is used as the default scaffold and task runner. Add cargo verification only for tasks that modify or validate Perry source, stdlib, FFI, or native modules.
+
+Perry official examples were cloned to `.forgets/perry-examples` at `PerryTS/perry-examples@88894791bb9b721ff516910e3c481d2510c8a1c6`. Treat them as ecosystem compatibility references for Express/Fastify/Hono/Koa/Nest/Next/library demos, not as the forgets runtime contract.
+
+---
+
+## Toolchain Boundary
+
+Vite+ is allowed to own the developer workflow:
+
+```txt
+vp check
+vp test
+vp pack
+vp run m0
+vp run build:native
+```
+
+Vite+ must not own the native framework contract:
+
+```txt
+.forgets/perry-entry.generated.ts content
+Perry dependency graph
+@forgets/runtime HTTP semantics
+native HTTP behavior suite
+release gate
+```
+
+Use `vp build` only for Vite application builds. The forgets native server build must remain `forgets build -> perry compile`, optionally wrapped by `vp run build:native`.
+
+Seed-plan command ownership:
+
+```txt
+npm scripts are the canonical runnable commands in this plan.
+Vite+ may wrap those commands, but must not be the only way to run them.
+Do not add a Vite application `build` task and call it a native server build.
+Add `build:native` only after `@forgets/cli` exposes `forgets build`.
+```
+
+Recommended Vite+ mapping once the scaffold enables Vite+. The `build:native` mapping is deferred until `@forgets/cli` exposes `forgets build`:
+
+```txt
+vp check              -> npm run check
+vp test               -> npm test
+vp run m0             -> npm run m0
+vp run build:native   -> npm run build:native
+```
 
 ---
 
 ## File Structure
 
-Create and modify these files:
+Create and modify these files in this seed plan:
 
 ```txt
 package.json
 tsconfig.json
 vitest.config.ts
+docs/forgets-toolchain.md
 
 packages/http/src/index.ts
 packages/http/src/types.ts
 packages/http/src/app.ts
 packages/http/src/route.ts
-packages/http/src/context.ts
 packages/http/src/response.ts
 packages/http/src/error.ts
-packages/http/src/middleware.ts
 packages/http/test/app.test.ts
 packages/http/test/response.test.ts
 
 packages/schema/src/index.ts
 packages/schema/src/schema.ts
-packages/schema/src/openapi.ts
 packages/schema/test/schema.test.ts
-packages/schema/test/openapi.test.ts
-
-packages/logger/src/index.ts
-packages/logger/src/logger.ts
-
-packages/middleware/src/index.ts
-packages/middleware/src/request-id.ts
-packages/middleware/src/recovery.ts
-packages/middleware/src/timeout.ts
-packages/middleware/src/access-log.ts
-packages/middleware/test/middleware.test.ts
-
-packages/runtime/src/index.ts
-packages/runtime/src/driver.ts
-packages/runtime/src/perry-fastify.ts
-packages/runtime/test/driver.test.ts
 
 packages/compiler/src/index.ts
 packages/compiler/src/static-routes.ts
-packages/compiler/src/openapi.ts
 packages/compiler/src/generate-entry.ts
 packages/compiler/src/diagnostics.ts
 packages/compiler/src/ai-context.ts
@@ -79,44 +109,62 @@ packages/compiler/test/static-routes.test.ts
 packages/compiler/test/generate-entry.test.ts
 packages/compiler/test/diagnostics.test.ts
 
-packages/cli/src/index.ts
-packages/cli/src/commands/check.ts
-packages/cli/src/commands/routes.ts
-packages/cli/src/commands/openapi.ts
-packages/cli/src/commands/build.ts
-
-examples/hello-world/src/main.ts
-examples/hello-world/src/server.ts
-examples/hello-world/src/app.ts
-examples/hello-world/src/health.routes.ts
-examples/hello-world/forgets.config.ts
-
 test-files/forgets-m0/decorators-fail.ts
 test-files/forgets-m0/basic-runtime.ts
 test-files/forgets-m0/async-concurrency.ts
 test-files/forgets-m0/thread-spawn.ts
 test-files/forgets-m0/abort-timeout.ts
-test-files/forgets-m0/fastify-smoke.ts
-test-files/forgets-m0/fastify-concurrent.ts
 scripts/forgets-m0.ps1
 
 docs/perry-compat.md
-docs/plaints-server-design.md
+docs/forgets-server-design.md
 docs/schemas/manifest.schema.json
 docs/schemas/diagnostics.schema.json
 docs/schemas/ai-context.schema.json
 ```
 
-Each package has one responsibility:
+Follow-up foundation plans must add these before production claims:
 
 ```txt
-http      public app, routes, context, middleware, errors, response normalization
-schema    runtime schema values, parsing, type inference, OpenAPI schema emit
-logger    structured logger
-middleware production middleware such as request id/access log/recovery/timeout
-runtime   Perry driver adapter hidden behind the framework API
-compiler  static route scanner, OpenAPI document generation, Perry entry generation, diagnostics, AI context
+docs/superpowers/plans/YYYY-MM-DD-forgets-runtime-driver.md
+docs/superpowers/plans/YYYY-MM-DD-forgets-production-middleware.md
+docs/superpowers/plans/YYYY-MM-DD-forgets-openapi-cli.md
+docs/superpowers/plans/YYYY-MM-DD-forgets-native-behavior-suite.md
+
+packages/runtime/src/driver.ts
+packages/runtime/src/perry-http.ts
+packages/runtime/test/driver.test.ts
+packages/middleware/src/request-id.ts
+packages/middleware/src/recovery.ts
+packages/middleware/src/timeout.ts
+packages/middleware/src/access-log.ts
+packages/schema/src/openapi.ts
+packages/compiler/src/openapi.ts
+packages/cli/src/commands/check.ts
+packages/cli/src/commands/routes.ts
+packages/cli/src/commands/openapi.ts
+packages/cli/src/commands/build.ts
+examples/hello-world/**
+native HTTP behavior suite
+```
+
+Package responsibility boundaries:
+
+```txt
+http      public app, routes, context shape, errors, response normalization
+schema    runtime schema values, parsing, type inference
+runtime   first-party Perry HTTP driver hidden behind the framework API
+compiler  static route scanner, Perry entry generation, diagnostics, AI context
 cli       user-facing commands that call compiler and Perry
+```
+
+Follow-up plan responsibilities:
+
+```txt
+runtime-driver          first-party Perry HTTP driver, Context adapter, response writeback
+production-middleware   request id, recovery, timeout response, body limit, access log
+openapi-cli             OpenAPI emit, routes/check/openapi/build commands, JSON schema validation
+native-behavior-suite   native HTTP behavior tests, concurrent request tests, release gate scripts
 ```
 
 ---
@@ -127,6 +175,7 @@ cli       user-facing commands that call compiler and Perry
 - Create: `package.json`
 - Create: `tsconfig.json`
 - Create: `vitest.config.ts`
+- Reference: `docs/forgets-toolchain.md`
 
 - [ ] **Step 1: Create root package manifest**
 
@@ -136,6 +185,7 @@ cli       user-facing commands that call compiler and Perry
   "private": true,
   "type": "module",
   "scripts": {
+    "check": "npm run typecheck && npm test",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -144,12 +194,33 @@ cli       user-facing commands that call compiler and Perry
   "devDependencies": {
     "@types/node": "^20.12.12",
     "typescript": "^5.6.3",
-    "vitest": "^2.1.9"
+    "vitest": "^4.1.5"
   }
 }
 ```
 
-- [ ] **Step 2: Create TypeScript config**
+- [ ] **Step 2: Record Vite+ scaffold boundary**
+
+Do not add a Vite application `build` script in this seed plan. Vite+ may be used to create or maintain the workspace, but these npm scripts remain the canonical commands:
+
+```txt
+npm run check
+npm test
+npm run typecheck
+npm run m0
+```
+
+If Vite+ is enabled during implementation, map it to the same scripts:
+
+```txt
+vp check -> npm run check
+vp test -> npm test
+vp run m0 -> npm run m0
+```
+
+Do not add `vp run build:native` until `@forgets/cli` implements `forgets build`.
+
+- [ ] **Step 3: Create TypeScript config**
 
 ```json
 {
@@ -174,7 +245,7 @@ cli       user-facing commands that call compiler and Perry
 }
 ```
 
-- [ ] **Step 3: Create Vitest config**
+- [ ] **Step 4: Create Vitest config**
 
 ```ts
 import { defineConfig } from "vitest/config";
@@ -186,22 +257,22 @@ export default defineConfig({
 });
 ```
 
-- [ ] **Step 4: Install dependencies**
+- [ ] **Step 5: Install dependencies**
 
 Run: `npm install`
 
 Expected: `package-lock.json` is created and npm exits with code 0.
 
-- [ ] **Step 5: Run empty test command**
+- [ ] **Step 6: Run empty test command**
 
 Run: `npm test -- --passWithNoTests`
 
 Expected: Vitest exits successfully with no discovered tests.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add package.json package-lock.json tsconfig.json vitest.config.ts
+git add package.json package-lock.json tsconfig.json vitest.config.ts docs/forgets-toolchain.md
 git commit -m "chore: scaffold forgets workspace"
 ```
 
@@ -284,6 +355,12 @@ export type ResponseValue =
   | unknown[]
   | ResponseBuilder;
 
+export interface CancellationSignal {
+  aborted: boolean;
+  reason?: unknown;
+  onAbort(handler: () => void): void;
+}
+
 export interface Context {
   method: string;
   path: string;
@@ -291,7 +368,7 @@ export interface Context {
   query: Record<string, string | string[]>;
   headers: Record<string, string>;
   state: Record<string, unknown>;
-  signal?: AbortSignal;
+  signal?: CancellationSignal;
   json<T>(schema?: { parse(value: unknown): T }): Promise<T>;
   text(): Promise<string>;
   bytes(): Promise<Uint8Array>;
@@ -829,8 +906,6 @@ git commit -m "feat(schema): add Perry-compatible schema MVP"
 - Create: `test-files/forgets-m0/async-concurrency.ts`
 - Create: `test-files/forgets-m0/thread-spawn.ts`
 - Create: `test-files/forgets-m0/abort-timeout.ts`
-- Create: `test-files/forgets-m0/fastify-smoke.ts`
-- Create: `test-files/forgets-m0/fastify-concurrent.ts`
 - Create: `scripts/forgets-m0.ps1`
 - Modify: `docs/perry-compat.md`
 
@@ -943,62 +1018,56 @@ console.log(JSON.stringify({
 }));
 ```
 
-- [ ] **Step 6: Add fastify smoke fixture**
+- [ ] **Step 6: Record native HTTP driver follow-up**
 
-```ts
-import fastify from "fastify";
+Do not add Fastify fixtures. Record first-party native HTTP smoke and concurrency fixtures as deferred M0/M1 items until Perry exposes a stable no-Fastify raw server API and `@forgets/runtime` can implement `createNativeHttpDriver()` without a private forgets Rust shim.
 
-const app = fastify();
+The official `perry-examples` repository may be used to compare single-entry app layout and ecosystem dependencies, but its Express/Fastify/Hono/Koa/Nest/Next examples must not replace the forgets no-Fastify native behavior suite.
 
-app.get("/healthz", async (_request, reply) => {
-  reply.status(200);
-  return { ok: true };
-});
-
-app.listen({ port: 3000, host: "127.0.0.1" });
-```
-
-- [ ] **Step 7: Add fastify concurrency smoke fixture**
-
-```ts
-import fastify from "fastify";
-
-const app = fastify();
-
-let inFlight = 0;
-let maxInFlight = 0;
-
-app.get("/wait", async (_request, reply) => {
-  inFlight += 1;
-  if (inFlight > maxInFlight) {
-    maxInFlight = inFlight;
-  }
-
-  await new Promise((resolve) => setTimeout(resolve, 50));
-
-  inFlight -= 1;
-  reply.status(200);
-  return { maxInFlight };
-});
-
-app.listen({ port: 3001, host: "127.0.0.1" });
-```
-
-- [ ] **Step 8: Add M0 PowerShell runner**
+- [ ] **Step 7: Add M0 PowerShell runner**
 
 ```powershell
 $ErrorActionPreference = "Stop"
 
 $Perry = "perry"
+$OutDir = ".forgets/m0"
+New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+
 $Cases = @(
-  @{ Name = "decorators-fail"; File = "test-files/forgets-m0/decorators-fail.ts"; ExpectCheckFailure = $true },
-  @{ Name = "basic-runtime"; File = "test-files/forgets-m0/basic-runtime.ts"; ExpectCheckFailure = $false },
-  @{ Name = "async-concurrency"; File = "test-files/forgets-m0/async-concurrency.ts"; ExpectCheckFailure = $false },
-  @{ Name = "thread-spawn"; File = "test-files/forgets-m0/thread-spawn.ts"; ExpectCheckFailure = $false },
-  @{ Name = "abort-timeout"; File = "test-files/forgets-m0/abort-timeout.ts"; ExpectCheckFailure = $false }
+  @{ Name = "decorators-fail"; File = "test-files/forgets-m0/decorators-fail.ts"; ExpectCheckFailure = $true; ExpectCompile = $false; ExpectRun = $false; Notes = "Perry rejects decorators at lowering" },
+  @{ Name = "basic-runtime"; File = "test-files/forgets-m0/basic-runtime.ts"; ExpectCheckFailure = $false; ExpectCompile = $true; ExpectRun = $true; Notes = "Records class/private/TextEncoder/Map/Promise behavior" },
+  @{ Name = "async-concurrency"; File = "test-files/forgets-m0/async-concurrency.ts"; ExpectCheckFailure = $false; ExpectCompile = $true; ExpectRun = $true; Notes = "Records Promise.all/timer async behavior" },
+  @{ Name = "thread-spawn"; File = "test-files/forgets-m0/thread-spawn.ts"; ExpectCheckFailure = $false; ExpectCompile = $true; ExpectRun = $true; Notes = "Records perry/thread spawn and parallelMap behavior" },
+  @{ Name = "abort-timeout"; File = "test-files/forgets-m0/abort-timeout.ts"; ExpectCheckFailure = $false; ExpectCompile = $true; ExpectRun = $true; Notes = "Records AbortController and AbortSignal.timeout behavior" }
 )
 
+$Results = @()
+
+if (-not (Get-Command $Perry -ErrorAction SilentlyContinue)) {
+  foreach ($Case in $Cases) {
+    $Results += [ordered]@{
+      Case = $Case.Name
+      Check = "not-run"
+      Compile = "not-run"
+      Run = "not-run"
+      Notes = "perry executable not found on PATH"
+    }
+  }
+
+  $Results | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 (Join-Path $OutDir "results.json")
+  throw "perry executable not found on PATH"
+}
+
 foreach ($Case in $Cases) {
+  $Result = [ordered]@{
+    Case = $Case.Name
+    Check = "not-run"
+    Compile = "not-run"
+    Run = "not-run"
+    Output = ""
+    Notes = $Case.Notes
+  }
+
   Write-Host "== $($Case.Name): perry check =="
   & $Perry check $Case.File
   $ExitCode = $LASTEXITCODE
@@ -1010,16 +1079,59 @@ foreach ($Case in $Cases) {
   if (-not $Case.ExpectCheckFailure -and $ExitCode -ne 0) {
     throw "$($Case.Name) was expected to pass perry check"
   }
+
+  if ($Case.ExpectCheckFailure) {
+    $Result.Check = "expected-failure"
+    $Result.Compile = "skipped"
+    $Result.Run = "skipped"
+    $Results += $Result
+    continue
+  }
+
+  $Result.Check = "passed"
+
+  if ($Case.ExpectCompile) {
+    $Binary = Join-Path $OutDir "$($Case.Name).exe"
+    Write-Host "== $($Case.Name): perry compile =="
+    & $Perry compile $Case.File -o $Binary
+
+    if ($LASTEXITCODE -ne 0) {
+      $Result.Compile = "failed"
+      $Results += $Result
+      throw "$($Case.Name) failed perry compile"
+    }
+
+    $Result.Compile = "passed"
+  }
+
+  if ($Case.ExpectRun) {
+    Write-Host "== $($Case.Name): run =="
+    $RunOutput = & $Binary 2>&1
+
+    if ($LASTEXITCODE -ne 0) {
+      $Result.Run = "failed"
+      $Result.Output = ($RunOutput -join "`n")
+      $Results += $Result
+      throw "$($Case.Name) failed native run"
+    }
+
+    $Result.Run = "passed"
+    $Result.Output = ($RunOutput -join "`n")
+  }
+
+  $Results += $Result
 }
+
+$Results | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 (Join-Path $OutDir "results.json")
 ```
 
-- [ ] **Step 9: Run M0 script**
+- [ ] **Step 8: Run M0 script**
 
 Run: `npm run m0`
 
-Expected: decorators fail check; basic runtime, async concurrency, thread spawn, and abort fixtures pass check. If `perry` is not on PATH, record the missing binary in `docs/perry-compat.md`.
+Expected: decorators fail check; basic runtime, async concurrency, thread spawn, and abort fixtures pass check, compile, and native run. The script writes `.forgets/m0/results.json`. If `perry` is not on PATH, the script writes not-run rows and fails; record that in `docs/perry-compat.md`.
 
-- [ ] **Step 10: Update compatibility document results**
+- [ ] **Step 9: Update compatibility document results**
 
 Add a `## M0 Results` section to `docs/perry-compat.md`:
 
@@ -1029,15 +1141,17 @@ Add a `## M0 Results` section to `docs/perry-compat.md`:
 | Case | Check | Compile | Run | Notes |
 | --- | --- | --- | --- | --- |
 | decorators-fail | expected failure | not run | not run | Perry rejects decorators at lowering |
-| basic-runtime | not run | not run | not run | Records class/private/TextEncoder/Map/Promise behavior |
-| async-concurrency | not run | not run | not run | Records Promise.all/timer async behavior |
-| thread-spawn | not run | not run | not run | Records perry/thread spawn and parallelMap behavior |
-| abort-timeout | not run | not run | not run | Records AbortController and AbortSignal.timeout behavior |
-| fastify-smoke | not run | not run | not run | Requires separate server smoke command |
-| fastify-concurrent | not run | not run | not run | Requires native server plus parallel client requests |
+| basic-runtime | copy from `.forgets/m0/results.json` | copy from `.forgets/m0/results.json` | copy from `.forgets/m0/results.json` | Records class/private/TextEncoder/Map/Promise behavior |
+| async-concurrency | copy from `.forgets/m0/results.json` | copy from `.forgets/m0/results.json` | copy from `.forgets/m0/results.json` | Records Promise.all/timer async behavior |
+| thread-spawn | copy from `.forgets/m0/results.json` | copy from `.forgets/m0/results.json` | copy from `.forgets/m0/results.json` | Records perry/thread spawn and parallelMap behavior |
+| abort-timeout | copy from `.forgets/m0/results.json` | copy from `.forgets/m0/results.json` | copy from `.forgets/m0/results.json` | Records AbortController and AbortSignal.timeout behavior |
+| native-http-smoke | deferred | deferred | deferred | Requires first-party driver follow-up; must not use Fastify |
+| native-http-concurrent | deferred | deferred | deferred | Requires first-party driver follow-up plus parallel client requests |
 ```
 
-- [ ] **Step 11: Commit**
+Do not leave successful positive cases as `not run`. If a positive case cannot compile or run, record `failed` plus the short failure reason in the Notes column.
+
+- [ ] **Step 10: Commit**
 
 ```bash
 git add test-files/forgets-m0 scripts/forgets-m0.ps1 docs/perry-compat.md
@@ -1072,12 +1186,14 @@ describe("inspectStaticRoutes", () => {
       }
     `;
 
-    expect(inspectStaticRoutes(source)).toEqual([
+    expect(inspectStaticRoutes(source, "src/users/users.routes.ts")).toEqual([
       {
         method: "GET",
         path: "/users/:id",
         tags: ["Users"],
-        source: "usersRoutes[0]",
+        source: "src/users/users.routes.ts",
+        factory: "usersRoutes",
+        index: 0,
       },
     ]);
   });
@@ -1100,10 +1216,12 @@ export interface StaticRoute {
   path: string;
   tags: string[];
   source: string;
+  factory: string;
+  index: number;
 }
 
-export function inspectStaticRoutes(sourceText: string): StaticRoute[] {
-  const file = ts.createSourceFile("routes.ts", sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+export function inspectStaticRoutes(sourceText: string, fileName = "routes.ts"): StaticRoute[] {
+  const file = ts.createSourceFile(fileName, sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const routes: StaticRoute[] = [];
 
   for (const statement of file.statements) {
@@ -1121,7 +1239,7 @@ export function inspectStaticRoutes(sourceText: string): StaticRoute[] {
 
     let index = 0;
     for (const element of routesArg.elements) {
-      const route = readRouteCall(element, prefixArg.text, factoryName, index);
+      const route = readRouteCall(element, prefixArg.text, fileName, factoryName, index);
       if (route) {
         routes.push(route);
         index += 1;
@@ -1151,7 +1269,7 @@ function findReturnedGroup(body: ts.Block): ts.CallExpression | undefined {
   return undefined;
 }
 
-function readRouteCall(node: ts.Node, prefix: string, factoryName: string, index: number): StaticRoute | undefined {
+function readRouteCall(node: ts.Node, prefix: string, fileName: string, factoryName: string, index: number): StaticRoute | undefined {
   if (!ts.isCallExpression(node)) return undefined;
   if (!ts.isPropertyAccessExpression(node.expression)) return undefined;
   if (!ts.isIdentifier(node.expression.expression)) return undefined;
@@ -1166,7 +1284,9 @@ function readRouteCall(node: ts.Node, prefix: string, factoryName: string, index
     method,
     path: joinPaths(prefix, pathArg.text),
     tags: readTags(optionsArg),
-    source: `${factoryName}[${index}]`,
+    source: fileName,
+    factory: factoryName,
+    index,
   };
 }
 
@@ -1323,16 +1443,21 @@ describe("AI context", () => {
   it("creates stable machine-readable project facts", () => {
     expect(createAiContext({
       projectName: "hello-world",
+      forgetsVersion: "0.1.0",
       perryVersion: "0.5.494",
+      packages: ["@forgets/http", "@forgets/runtime"],
       generatedEntry: ".forgets/perry-entry.generated.ts",
       routes: [
         {
           method: "GET",
           path: "/healthz",
           tags: ["Health"],
-          source: "healthRoutes[0]",
+          source: "src/health.routes.ts",
+          factory: "healthRoutes",
+          index: 0,
         },
       ],
+      schemaNames: [],
       configKeys: ["PORT", "LOG_LEVEL"],
       diagnostics: [],
       nativeCompatibility: {
@@ -1345,16 +1470,21 @@ describe("AI context", () => {
       schemaVersion: 1,
       framework: "forgets",
       projectName: "hello-world",
+      forgetsVersion: "0.1.0",
       perryVersion: "0.5.494",
+      packages: ["@forgets/http", "@forgets/runtime"],
       generatedEntry: ".forgets/perry-entry.generated.ts",
       routes: [
         {
           method: "GET",
           path: "/healthz",
           tags: ["Health"],
-          source: "healthRoutes[0]",
+          source: "src/health.routes.ts",
+          factory: "healthRoutes",
+          index: 0,
         },
       ],
+      schemaNames: [],
       configKeys: ["PORT", "LOG_LEVEL"],
       diagnostics: [],
       nativeCompatibility: {
@@ -1429,13 +1559,18 @@ export interface AiRouteFact {
   path: string;
   tags: string[];
   source: string;
+  factory?: string;
+  index?: number;
 }
 
 export interface AiContextInput {
   projectName: string;
+  forgetsVersion: string;
   perryVersion: string;
+  packages: string[];
   generatedEntry: string;
   routes: AiRouteFact[];
+  schemaNames: string[];
   configKeys: string[];
   diagnostics: Diagnostic[];
   nativeCompatibility: NativeCompatibility;
@@ -1452,9 +1587,12 @@ export interface AiContext {
   schemaVersion: 1;
   framework: "forgets";
   projectName: string;
+  forgetsVersion: string;
   perryVersion: string;
+  packages: string[];
   generatedEntry: string;
   routes: AiRouteFact[];
+  schemaNames: string[];
   configKeys: string[];
   diagnostics: Diagnostic[];
   nativeCompatibility: NativeCompatibility;
@@ -1465,9 +1603,12 @@ export function createAiContext(input: AiContextInput): AiContext {
     schemaVersion: 1,
     framework: "forgets",
     projectName: input.projectName,
+    forgetsVersion: input.forgetsVersion,
     perryVersion: input.perryVersion,
+    packages: input.packages,
     generatedEntry: input.generatedEntry,
     routes: input.routes,
+    schemaNames: input.schemaNames,
     configKeys: input.configKeys,
     diagnostics: input.diagnostics,
     nativeCompatibility: input.nativeCompatibility,
@@ -1587,18 +1728,23 @@ git commit -m "feat(compiler): publish artifact JSON schema contracts"
 
 ## Self-Review Checklist
 
-- [ ] `docs/plaints-server-design.md` still states the complete production-framework target.
+- [ ] `docs/forgets-server-design.md` still states the complete production-framework target.
 - [ ] `docs/perry-compat.md` records Perry version `0.5.494`.
 - [ ] Generated Perry entry imports `buildServer()` and no user module performs top-level listen as a build contract.
 - [ ] No public API depends on decorators, `reflect-metadata`, or runtime type reflection.
 - [ ] Route factories remain statically inspectable without executing user code.
-- [ ] `@forgets/runtime` hides Perry native fastify details.
+- [ ] `@forgets/runtime` hides Perry native HTTP primitive details.
 - [ ] Concurrency contract states default async, explicit CPU parallelism, and per-request Context isolation.
 - [ ] Diagnostics have stable codes, human formatting, and JSON formatting.
 - [ ] AI context output excludes secret values and includes route/config/native facts.
 - [ ] Artifact JSON outputs have checked-in schemas under `docs/schemas`.
 - [ ] Host tests pass with `npm test`.
 - [ ] TypeScript passes with `npm run typecheck`.
-- [ ] M0 script records Perry check behavior with `npm run m0`.
+- [ ] M0 script records Perry check/compile/run behavior with `npm run m0`.
+- [ ] `.forgets/m0/results.json` is produced or `docs/perry-compat.md` records why it was not produced.
 - [ ] M0/M1 native suites include async concurrency, perry/thread, concurrent requests, and CPU-bound offload behavior.
 - [ ] Native production claims are backed by Perry compile/run results.
+- [ ] Official `perry-examples` are treated as compatibility references, not runtime contract.
+- [ ] Vite+ is used only as scaffold/tooling orchestration; npm/perry paths still reproduce core checks.
+- [ ] Cargo is required only when a task touches Perry source, stdlib, FFI, or native modules.
+- [ ] Follow-up plans are created for runtime driver, production middleware, OpenAPI/CLI, and native behavior suite before any production claim.

@@ -47,6 +47,10 @@
         "factory": {
           "type": "string"
         },
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        },
         "tags": {
           "type": "array",
           "items": {

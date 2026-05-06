@@ -1,16 +1,64 @@
 # Perry Compatibility Baseline
 
-> M0 compatibility baseline for `forgets`. This file is a source-audit baseline, not a completed native compile/run report yet.
+> Source-audit and native smoke baseline for `forgets`.
 
 ## Scope
 
 ```txt
 Perry source: docs/perry-main-src/perry-main
 Workspace version: 0.5.494
-Status: source-audit baseline, native tests pending
+M0 CLI package: @perryts/perry 0.5.511
+Tracked upstream source: .forgets/perry-github-main
+Tracked upstream version: 0.5.585
+Status: source-audit baseline plus M0/M1 native smoke evidence
 ```
 
 Perry docs and Perry source can drift. `forgets` should treat source audit plus M0 native tests as the framework capability boundary.
+
+### Perry 0.5.585 Source Build
+
+As of 2026-05-06, `@perryts/perry` on npm still reports `latest: 0.5.511`. The Perry GitHub release page has `v0.5.585`, and `perry update --check-only` detects `0.5.511 -> 0.5.585`, but `perry update --force` cannot complete on Windows because the expected `perry-windows-x86_64.zip` binary asset is not available through the release API.
+
+Local source tracking:
+
+```txt
+Local: .forgets/perry-github-main
+Remote: https://github.com/PerryTS/perry.git
+Commit: 9ac09171e17e7eec49e4c9d10054bf1ec2580d2a
+Commit date: 2026-05-06 07:55:58 +0200
+Commit subject: docs(benchmarks): refresh Perry numbers for v0.5.585 fast-math opt-in
+Workspace version: 0.5.585
+```
+
+Source build evidence:
+
+```txt
+cargo build --release -p perry
+cargo build --release -p perry-runtime -p perry-stdlib -p perry-ui-windows
+.forgets/perry-github-main/target/release/perry.exe --version
+perry 0.5.585
+```
+
+Doctor evidence with source-built libraries:
+
+```txt
+PERRY_RUNTIME_DIR=.forgets/perry-github-main/target/release
+PERRY_LIB_DIR=.forgets/perry-github-main/target/release
+perry doctor
+OK perry version: 0.5.585
+OK clang (LLVM codegen)
+OK system linker (MSVC link.exe)
+OK runtime library: .forgets/perry-github-main/target/release/perry_runtime.lib
+WARN project config (perry.toml): not found
+```
+
+Decision:
+
+```txt
+Keep package.json on npm Perry 0.5.511 for reproducible installs.
+Use source-built Perry 0.5.585 through PERRY/PERRY_RUNTIME_DIR/PERRY_LIB_DIR for research and compatibility probes.
+Do not claim the project has upgraded its npm dependency to 0.5.585 until npm publishes that version.
+```
 
 ---
 
@@ -156,33 +204,115 @@ Do not promise automatic multi-core execution of every TS request handler.
 Concurrent request behavior, request isolation, and CPU-bound blocking must be native-tested.
 ```
 
-### Native Fastify
+### First-party Native HTTP
 
-Perry has a native fastify stdlib path covering route registration, listen, request params/query/header/body, and reply status/send APIs.
+As of 2026-05-06, the checked local package is `@perryts/perry 0.5.511`. Public GitHub `PerryTS/perry` main was also checked and source-built at commit `9ac09171e17e7eec49e4c9d10054bf1ec2580d2a` (`2026-05-06 07:55:58 +0200`, workspace version `0.5.585`).
+
+The current upstream public server path is Fastify-backed:
+
+```txt
+crates/perry-ext-fastify
+test-files/test_fastify_integration.ts
+docs/examples/stdlib/http/snippets.ts
+```
+
+Perry also has `crates/perry-ext-http`, but that extension targets Node `http`/`https` client-style APIs, not the first-party no-Fastify server driver that forgets needs.
+
+There is still a lower-level hyper-based HTTP server under `crates/perry-stdlib/src/framework`. It accepts connections with Tokio/hyper, passes pending requests through a channel to the TS side, and waits for a response channel to write back. Upstream Cargo feature comments keep this path for non-Fastify hyper users, but the request/response/server framework files currently show no meaningful coverage in the checked coverage reports.
+
+Directly declaring raw `js_http_*` symbols from TypeScript is not a stable API in `@perryts/perry 0.5.511` or source-built `0.5.585`. In `0.5.585`, `runtime_decls.rs` declares the raw HTTP server symbols and `perry-stdlib/src/framework` still exports them behind the `http-server` feature, but auto-optimize only enables stdlib features detected from native module imports. A direct `declare function js_http_*` path does not register any native module import, so the `0.5.585` default compile rebuilds stdlib with no optional features and fails to link these symbols.
+
+Forced full-stdlib compile with `--no-auto-optimize` proves the symbols can link, but the smoke server still times out on `/healthz`. That keeps the earlier ABI/runtime conclusion: raw `js_http_*` direct declarations are not a usable framework contract.
 
 Source:
 
 ```txt
-docs/perry-main-src/perry-main/crates/perry-stdlib/src/fastify
+docs/perry-main-src/perry-main/crates/perry-stdlib/src/lib.rs
+docs/perry-main-src/perry-main/crates/perry-stdlib/src/framework/server.rs
+docs/perry-main-src/perry-main/crates/perry-stdlib/src/framework/request.rs
+docs/perry-main-src/perry-main/crates/perry-stdlib/src/framework/response.rs
+docs/perry-main-src/perry-main/crates/perry-stdlib/Cargo.toml
 docs/perry-main-src/perry-main/crates/perry-codegen/src/lower_call.rs
+docs/perry-main-src/perry-main/crates/perry-codegen/src/runtime_decls.rs
+docs/perry-main-src/perry-main/crates/perry/src/commands/stdlib_features.rs
+docs/perry-main-src/perry-main/crates/perry/src/commands/compile/optimized_libs.rs
+https://github.com/PerryTS/perry/tree/main/crates/perry-ext-fastify
+https://github.com/PerryTS/perry/tree/main/crates/perry-ext-http
+https://github.com/PerryTS/perry/blob/main/test-files/test_fastify_integration.ts
+https://github.com/PerryTS/perry/blob/main/docs/examples/stdlib/http/snippets.ts
 ```
 
 Source-audit risks:
 
 ```txt
-bodyLimit must be tested at actual server body-read time
-setErrorHandler/onError must be tested through request dispatch
-undefined/null response behavior differs from forgets 204 semantics
+Official upstream server example currently uses Fastify
+no-Fastify raw server API is not exposed as a stable TypeScript module
+direct js_http_* declarations are ABI-unsafe in Perry 0.5.511
+direct js_http_* declarations are not auto-optimize-visible in source-built Perry 0.5.585
+hyper-based framework primitives need upstream API/ABI work before production use
+bodyLimit must be enforced by the forgets adapter/driver, regardless of the underlying transport
+undefined/null response behavior must be normalized by forgets
 request id should be generated by forgets
-server.close/graceful close must be tested
+close/graceful close must be implemented and native-tested by forgets
+request queue/backpressure/max concurrency must be explicit forgets behavior
 ```
 
 Framework decision:
 
 ```txt
-v1 can wrap Perry native fastify.
+v1 default native HTTP path wraps Perry's official Fastify-compatible server support inside @forgets/runtime.
+Do not expose Fastify as the public framework API or plugin/hook contract.
+Do not reintroduce a private @forgets/perry-http-core Rust shim as the production path.
+forgets should keep a first-party Perry-native HTTP driver contract in TypeScript.
+Raw no-Fastify transport remains experimental until Perry exposes a stable TypeScript module or the upstream stdlib/FFI/codegen path is fixed.
+M1 native HTTP smoke uses the Fastify-backed path.
 The public contract is forgets Context/Middleware/ResponseValue/Error.
-recovery/body limit/request id/timeout/response normalization live in forgets.
+recovery/body limit/request id/timeout/response normalization live in the forgets adapter, not in Fastify plugins.
+```
+
+Current 0.5.585 Fastify-backed native evidence:
+
+```txt
+Command: npm run m1:http
+Perry: source-built .forgets/perry-github-main/target/release/perry.exe 0.5.585
+Environment: PERRY_RUNTIME_DIR/PERRY_LIB_DIR=.forgets/perry-github-main/target/release
+Host Fastify dependency: fastify 5.8.5
+Result: perry check passed, perry compile passed, native run passed.
+Smoke: GET /healthz and POST /echo passed.
+Artifact: .forgets/m1-http/results.json records Healthz=passed and Echo=passed.
+Server log: "forgets ready port=<port>" and "Server listening on http://0.0.0.0:<port>".
+Audit: npm audit --omit=dev found 0 vulnerabilities after upgrading Fastify to 5.8.5.
+```
+
+Raw `js_http_*` experiment evidence:
+
+```txt
+Default compile failed at link with unresolved js_http_server_create, js_http_server_accept_v2, js_http_request_method, js_http_request_path, js_http_request_query, js_http_request_headers_all, js_http_request_body, js_http_respond_with_headers.
+Root cause: auto-optimize rebuilt runtime+stdlib with features=(no optional features), because direct raw declarations do not map to stdlib_features.rs module imports.
+Control compile with --no-auto-optimize succeeded and produced native-http-smoke-full.exe.
+Control run printed "forgets ready port=<port>", but curl /healthz timed out after 2 seconds.
+```
+
+### Official Examples
+
+The official examples repository was cloned for local reference:
+
+```txt
+Local: .forgets/perry-examples
+Remote: https://github.com/PerryTS/perry-examples
+Checked commit: 88894791bb9b721ff516910e3c481d2510c8a1c6
+Commit date: 2026-04-30 17:49:36 +0200
+```
+
+The examples are standalone app compatibility samples. They cover Express/PostgreSQL, Fastify/Redis/MySQL, Hono/MongoDB, Koa/Redis, NestJS/TypeORM, Next.js/Prisma, and a blockchain/library compatibility demo. The README instructs users to enter one subdirectory, install dependencies, and run `perry build src/index.ts -o server`.
+
+Framework decision:
+
+```txt
+Use perry-examples as ecosystem compatibility reference.
+Do not copy its package.json files as forgets production defaults.
+Do not treat its framework examples as the forgets runtime contract.
+Fastify can be used as the v1 Perry-native transport substrate, but only behind the forgets runtime adapter.
 ```
 
 ---
@@ -190,6 +320,17 @@ recovery/body limit/request id/timeout/response normalization live in forgets.
 ## M0 Native Test Matrix
 
 Add compile/run results here as tests are created.
+
+Seed runner contract:
+
+```txt
+scripts/forgets-m0.ps1 writes .forgets/m0/results.json.
+Positive cases must record check, compile, and native run.
+Expected-negative cases may record expected-failure and skip compile/run.
+If perry is missing, record not-run rows and the install guidance.
+Each case is copied into an isolated .forgets/m0/work/<run>/<case> directory before check/compile, because Perry check may otherwise scan sibling fixtures in the same input directory.
+Native HTTP rows stay deferred until the first-party @forgets/runtime driver exists.
+```
 
 ```txt
 M0-001 decorators should fail at lowering
@@ -205,9 +346,9 @@ M0-010 AbortSignal.timeout real timer semantics
 M0-011 dynamic import is rejected or returns unsupported result
 M0-012 perry check generated entry
 M0-013 perry compile generated entry
-M0-014 native fastify GET route
-M0-015 native fastify path params/query/header/body
-M0-016 native fastify JSON response/status/header
+M0-014 first-party native HTTP GET route
+M0-015 first-party native HTTP path params/query/header/body
+M0-016 first-party native HTTP JSON response/status/header
 M0-017 undefined/null response baseline
 M0-018 handler throw/rejection baseline
 M0-019 bodyLimit baseline
@@ -215,9 +356,53 @@ M0-020 process.on signal/graceful shutdown baseline
 M0-021 Promise.all async concurrency baseline
 M0-022 perry/thread spawn baseline
 M0-023 perry/thread parallelMap baseline
-M0-024 native fastify concurrent requests baseline
+M0-024 first-party native HTTP concurrent requests baseline
 M0-025 CPU-bound handler blocking/offload baseline
 ```
+
+## M0 Results
+
+Last attempted run:
+
+```txt
+Command: npm run m0
+Perry: source-built .forgets/perry-github-main/target/release/perry.exe 0.5.585
+Environment: PERRY_RUNTIME_DIR/PERRY_LIB_DIR=.forgets/perry-github-main/target/release
+Result: expected decorator failure plus four positive check/compile/run cases passed.
+Doctor: source-built perry doctor reports all critical checks passed; project config perry.toml is still only a warning.
+Artifact: .forgets/m0/results.json was written with per-case check/compile output.
+```
+
+| Case | Check | Compile | Run | Notes |
+| --- | --- | --- | --- | --- |
+| decorators-fail | expected-failure | skipped | skipped | Perry rejects decorators with U006 |
+| basic-runtime | passed | passed | passed | Output recorded class/private/TextEncoder/Map/Promise behavior |
+| async-concurrency | passed | passed | passed | Output recorded Promise.all/timer async behavior |
+| thread-spawn | passed | passed | passed | Output recorded perry/thread spawn and parallelMap behavior |
+| abort-timeout | passed | passed | passed | check/compile pass with AbortSignal warning; output recorded abort listener and timeout initial state |
+| native-http-smoke | deferred | deferred | deferred | Minimal Fastify-backed smoke is tracked under M1; expanded behavior suite remains follow-up |
+| native-http-concurrent | deferred | deferred | deferred | Requires first-party driver follow-up plus parallel client requests |
+
+---
+
+## M1 HTTP Results
+
+Latest run:
+
+```txt
+Command: npm run m1:http
+Perry: source-built .forgets/perry-github-main/target/release/perry.exe 0.5.585
+Environment: PERRY_RUNTIME_DIR/PERRY_LIB_DIR=.forgets/perry-github-main/target/release
+Result: perry check passed; perry compile passed; native run passed.
+Smoke: GET /healthz and POST /echo passed.
+Artifact: .forgets/m1-http/results.json records Check=passed, Compile=passed, Run=passed, Healthz=passed, Echo=passed.
+```
+
+| Case | Check | Compile | Run | Notes |
+| --- | --- | --- | --- | --- |
+| native-http-smoke | passed | passed | passed | Fastify-backed `createNativeHttpDriver(app).listen(port)`; `/healthz` and `/echo` passed |
+| raw native-http-smoke | passed | failed | not-run | historical `js_http_*` experiment; unresolved with auto-optimize features=(no optional features) |
+| raw native-http-smoke --no-auto-optimize | not-scripted | passed | failed | historical control; full stdlib links, server starts, `/healthz` times out |
 
 ---
 
@@ -232,7 +417,7 @@ schema-first runtime boundaries
 no decorator metadata
 no reflection DI
 single generated Perry entry
-driver hidden behind @forgets/http
+first-party driver hidden behind @forgets/http
 default async, explicit CPU parallelism
 per-request Context isolation
 Perry native smoke tests before production claims

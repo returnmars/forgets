@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "declaration": true,
+    "skipLibCheck": true,
+    "baseUrl": ".",
+    "paths": {
+      "@forgets/http": ["packages/http/src/index.ts"],
+      "@forgets/schema": ["packages/schema/src/index.ts"],
+      "@forgets/logger": ["packages/logger/src/index.ts"],
+      "@forgets/middleware": ["packages/middleware/src/index.ts"],
+      "@forgets/runtime": ["packages/runtime/src/index.ts"],
+      "@forgets/compiler": ["packages/compiler/src/index.ts"]
+    }
+  },
+  "include": ["packages/**/*.ts", "examples/**/*.ts", "test-files/**/*.ts"]
+}
