@@ -1473,6 +1473,7 @@ throw HttpError.unauthorized("Unauthorized");
 使用 Perry 官方 Fastify-compatible server path 作为 v1 native HTTP 传输底座。
 host-side dependency 当前为 fastify ^5.8.5，避免 Fastify 4.x 的 high-severity audit 风险。
 runtime adapter 负责把 inspected routes 映射到 Fastify，并在进入 forgets handler 前捕获 method/path/query/header/body。
+runtime adapter 在进入 handler 前经过 @forgets/runtime RequestScheduler，统一控制 admission、排队、队列超时和 busy 503。
 Fastify 只承担 listen/socket/request/reply 承接，不承诺插件、hook、route 语义兼容。
 raw no-Fastify driver 继续作为实验路径；等 Perry 暴露稳定 no-Fastify raw HTTP server module 后再升级。
 如果现有 primitives 不满足 route dispatch/body limit/header/status/concurrency 需求，就在 Perry upstream stdlib/FFI/codegen 层补齐最小 HTTP core。
@@ -1525,8 +1526,10 @@ I/O-bound handler 默认使用 async/await。
 CPU-bound 工作必须显式用 perry/thread spawn/parallelMap 或 native module offload。
 每个 request 创建独立 Context、state、request id、timeout state。
 middleware 和 handler 不得持有可变全局 request 状态。
-driver 必须记录 in-flight request，并为后续 maxConcurrentRequests/requestQueueLimit 留接口。
+driver 通过 RequestScheduler 记录 active/queued request，并提供 maxConcurrentRequests/requestQueueLimit/queueTimeoutMs。
+队列满或排队超时时返回 `HttpError(503, "Server Busy", { code: "FORGETS_BUSY" })`，再走统一 response normalization。
 timeout v1 只切断 response boundary，不宣称取消底层 I/O。
+当前 Perry Fastify-backed native path 的 TS handler dispatch 仍以 M1 `serial-observed` 为准；RequestScheduler 是 forgets admission/backpressure 策略，不是 Perry 多线程 handler 并行保证。
 ```
 
 推荐 handler 形态：

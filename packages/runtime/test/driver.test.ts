@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import { createApp } from "../../http/src/index";
 import {
   createFastifyHttpDriver,
+  createRequestScheduler,
 } from "../src/index";
+import type { RequestScheduler } from "../src/index";
 import { createPerryHttpTransport, createTransportHttpDriver } from "../src/raw-driver";
 import type {
   NativeHttpRequestSnapshot,
@@ -88,6 +90,65 @@ describe("native HTTP driver", () => {
     expect(response.statusCode).toBe(404);
     expect(response.body).toBe(
       '{"error":{"code":"FORGETS_NOT_FOUND","message":"Route not found","status":404}}',
+    );
+
+    await server.close();
+  });
+
+  it("runs Fastify route handlers through the configured scheduler", async () => {
+    const app = createApp();
+    let calls = 0;
+    const scheduler: RequestScheduler = {
+      active: 0,
+      queued: 0,
+      options: {
+        maxConcurrentRequests: 1,
+        requestQueueLimit: 0,
+        queueTimeoutMs: 0,
+        rejectStatus: 503,
+        rejectCode: "FORGETS_BUSY",
+        rejectMessage: "Server Busy",
+      },
+      async run(task) {
+        calls += 1;
+        return task();
+      },
+    };
+
+    app.get("/scheduled", () => ({ ok: true }));
+
+    const server = createFastifyHttpDriver(app, { scheduler }).buildServer();
+    const response = await server.inject({
+      method: "GET",
+      url: "/scheduled",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toBe('{"ok":true}');
+    expect(calls).toBe(1);
+
+    await server.close();
+  });
+
+  it("returns 503 when the configured scheduler rejects an admitted request", async () => {
+    const app = createApp();
+    app.get("/busy", () => ({ ok: true }));
+
+    const server = createFastifyHttpDriver(app, {
+      scheduler: createRequestScheduler({
+        maxConcurrentRequests: 0,
+        requestQueueLimit: 0,
+      }),
+    }).buildServer();
+
+    const response = await server.inject({
+      method: "GET",
+      url: "/busy",
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.body).toBe(
+      '{"error":{"code":"FORGETS_BUSY","message":"Server Busy","status":503}}',
     );
 
     await server.close();

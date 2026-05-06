@@ -272,7 +272,9 @@ forgets should keep a first-party Perry-native HTTP driver contract in TypeScrip
 Raw no-Fastify transport remains experimental until Perry exposes a stable TypeScript module or the upstream stdlib/FFI/codegen path is fixed.
 M1 native HTTP smoke uses the Fastify-backed path.
 The public contract is forgets Context/Middleware/ResponseValue/Error.
-recovery/body limit/request id/timeout/response normalization live in the forgets adapter, not in Fastify plugins.
+recovery/body limit/request id/timeout/request scheduling/response normalization live in the forgets adapter, not in Fastify plugins.
+RequestScheduler owns forgets admission/backpressure policy: active request limit, FIFO queue, queue timeout, and structured FORGETS_BUSY 503 responses.
+This scheduler does not change the current Fastify-backed native observation that Perry processes TS route dispatch serially.
 ```
 
 Current 0.5.585 Fastify-backed native evidence:
@@ -285,6 +287,7 @@ Host Fastify dependency: fastify 5.8.5
 Result: perry check passed, perry compile passed, native run passed.
 Smoke: GET /healthz, POST /echo, request id, recovery, body limit, timeout, and access log passed.
 Concurrent probe: slow async route completes, but /slow-started cannot observe it while pending; ConcurrentDispatch=serial-observed and StateIsolation=not-observed.
+Host tests cover RequestScheduler admission behavior and Fastify driver busy 503 normalization.
 Artifact: .forgets/m1-http/results.json records Healthz=passed, Echo=passed, RequestId=passed, Recovery=passed, BodyLimit=passed, Timeout=passed, AccessLog=passed, ConcurrentDispatch=serial-observed, and StateIsolation=not-observed.
 Server log: "forgets ready port=<port>" and "Server listening on http://0.0.0.0:<port>".
 Audit: npm audit --omit=dev found 0 vulnerabilities after upgrading Fastify to 5.8.5.
@@ -402,6 +405,7 @@ Environment: PERRY_RUNTIME_DIR/PERRY_LIB_DIR=.forgets/perry-github-main/target/r
 Result: perry check passed; perry compile passed; native run passed.
 Smoke: GET /healthz, POST /echo, request id, recovery, body limit, timeout, and access log passed.
 Concurrent probe: Fastify-backed native TS route dispatch is serial-observed; true concurrent TS route state isolation is not-observed.
+Request admission: @forgets/runtime routes Fastify-backed handlers through RequestScheduler for maxConcurrentRequests/requestQueueLimit/queueTimeoutMs and structured FORGETS_BUSY 503 responses.
 Artifact: .forgets/m1-http/results.json records Check=passed, Compile=passed, Run=passed, Healthz=passed, Echo=passed, RequestId=passed, Recovery=passed, BodyLimit=passed, Timeout=passed, AccessLog=passed, ConcurrentDispatch=serial-observed, and StateIsolation=not-observed.
 ```
 

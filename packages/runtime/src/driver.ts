@@ -15,6 +15,11 @@ import {
   createContext,
   type NativeHttpRequestSnapshot,
 } from "./context";
+import {
+  createRequestScheduler,
+  type RequestScheduler,
+  type RequestSchedulerOptions,
+} from "./scheduler";
 
 declare module "fastify" {
   interface FastifyRequest {
@@ -29,22 +34,36 @@ export interface FastifyHttpDriver {
 
 export type NativeHttpDriver = FastifyHttpDriver;
 
+export interface RuntimeHttpDriverOptions {
+  scheduler?: RequestScheduler;
+  schedulerOptions?: RequestSchedulerOptions;
+}
+
 interface PerryFastifyRequestMethods {
   query(): Record<string, unknown>;
   rawBody(): string;
 }
 
-export function createNativeHttpDriver(app: App): NativeHttpDriver {
-  return createFastifyHttpDriver(app);
+export function createNativeHttpDriver(
+  app: App,
+  options: RuntimeHttpDriverOptions = {},
+): NativeHttpDriver {
+  return createFastifyHttpDriver(app, options);
 }
 
-export function createFastifyHttpDriver(app: App): FastifyHttpDriver {
+export function createFastifyHttpDriver(
+  app: App,
+  options: RuntimeHttpDriverOptions = {},
+): FastifyHttpDriver {
+  const scheduler =
+    options.scheduler ?? createRequestScheduler(options.schedulerOptions);
+
   function buildServer(): FastifyInstance {
     const server = Fastify({ logger: false });
     const routes = app.inspectRoutes();
 
     for (const inspected of routes) {
-      registerFastifyRoute(server, inspected);
+      registerFastifyRoute(server, inspected, scheduler);
     }
 
     server.setNotFoundHandler(async (_request, reply) => {
@@ -82,6 +101,7 @@ export function createFastifyHttpDriver(app: App): FastifyHttpDriver {
                 },
                 normalizeUnknownRecord(request.params),
                 reply,
+                scheduler,
               );
             });
             break;
@@ -100,6 +120,7 @@ export function createFastifyHttpDriver(app: App): FastifyHttpDriver {
                 },
                 normalizeUnknownRecord(request.params),
                 reply,
+                scheduler,
               );
             });
             break;
@@ -118,6 +139,7 @@ export function createFastifyHttpDriver(app: App): FastifyHttpDriver {
                 },
                 normalizeUnknownRecord(request.params),
                 reply,
+                scheduler,
               );
             });
             break;
@@ -136,6 +158,7 @@ export function createFastifyHttpDriver(app: App): FastifyHttpDriver {
                 },
                 normalizeUnknownRecord(request.params),
                 reply,
+                scheduler,
               );
             });
             break;
@@ -154,6 +177,7 @@ export function createFastifyHttpDriver(app: App): FastifyHttpDriver {
                 },
                 normalizeUnknownRecord(request.params),
                 reply,
+                scheduler,
               );
             });
             break;
@@ -172,6 +196,7 @@ export function createFastifyHttpDriver(app: App): FastifyHttpDriver {
                 },
                 normalizeUnknownRecord(request.params),
                 reply,
+                scheduler,
               );
             });
             break;
@@ -190,6 +215,7 @@ export function createFastifyHttpDriver(app: App): FastifyHttpDriver {
                 },
                 normalizeUnknownRecord(request.params),
                 reply,
+                scheduler,
               );
             });
             break;
@@ -215,12 +241,13 @@ export function createFastifyHttpDriver(app: App): FastifyHttpDriver {
 function registerFastifyRoute(
   server: FastifyInstance,
   inspected: InspectedRoute,
+  scheduler: RequestScheduler,
 ): void {
   const handler = async (
     request: FastifyRequest,
     reply: FastifyReply,
   ): Promise<void> => {
-    await handleFastifyRequest(inspected, request, reply);
+    await handleFastifyRequest(inspected, request, reply, scheduler);
   };
 
   switch (inspected.method) {
@@ -252,12 +279,14 @@ async function handleFastifyRequest(
   inspected: InspectedRoute,
   request: FastifyRequest,
   reply: FastifyReply,
+  scheduler: RequestScheduler,
 ): Promise<void> {
   await handleFastifySnapshot(
     inspected,
     snapshotFastifyRequest(request),
     normalizeUnknownRecord(request.params),
     reply,
+    scheduler,
   );
 }
 
@@ -266,6 +295,7 @@ async function handleFastifySnapshot(
   snapshot: NativeHttpRequestSnapshot,
   params: Record<string, string>,
   reply: FastifyReply,
+  scheduler: RequestScheduler,
 ): Promise<void> {
   const responseHeaders: Record<string, string> = {};
   const ctx = createContext(
@@ -275,7 +305,7 @@ async function handleFastifySnapshot(
   );
 
   try {
-    const value = await inspected.handler(ctx);
+    const value = await scheduler.run(() => inspected.handler(ctx));
     const response = normalizeResponse(value);
     writeFastifyResponse(reply, {
       ...response,
